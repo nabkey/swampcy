@@ -1,0 +1,141 @@
+/* swampcy web: the desktop fills the page, letterboxed; a small toolbar floats over it. */
+:root {
+  color-scheme: dark;
+  --ui-bg: rgba(20, 24, 22, 0.78);
+  --ui-border: rgba(255, 255, 255, 0.14);
+  --ui-fg: #d6e2d8;
+  --accent: #8fb85a;
+  --font: -apple-system, system-ui, "Segoe UI", sans-serif;
+}
+html, body {
+  margin: 0; height: 100%; overflow: hidden; background: #000; color: var(--ui-fg);
+  font: 14px var(--font);
+  -webkit-text-size-adjust: 100%; overscroll-behavior: none;
+}
+#app { position: relative; height: 100%; display: flex; flex-direction: column; }
+
+/* The stage takes every gesture; the browser's own zoom, scroll and callouts are off. */
+#stage {
+  position: relative; flex: 1; min-height: 0; overflow: hidden; background: #000;
+  touch-action: none; -webkit-user-select: none; user-select: none;
+  -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; cursor: default;
+}
+#view { position: absolute; inset: 0; transform-origin: 0 0; will-change: transform; }
+#screen {
+  position: absolute; left: 0; top: 0; width: 100%; height: 100%;
+  object-fit: fill; background: #000; pointer-events: none;
+}
+#fx { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+.pulse {
+  position: absolute; width: 56px; height: 56px; margin: -28px 0 0 -28px; border-radius: 50%;
+  border: 2px solid var(--accent); animation: pulse 0.45s ease-out forwards;
+}
+@keyframes pulse { from { transform: scale(0.3); opacity: 1; } to { transform: scale(1.2); opacity: 0; } }
+
+#overlay {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  max-width: 80%; padding: 10px 16px; border-radius: 10px; text-align: center;
+  background: var(--ui-bg); border: 1px solid var(--ui-border); pointer-events: none;
+}
+#overlay[hidden] { display: none; }
+#overlay.error { color: #ffb4a8; }
+
+/* Which desktop, asked on opening: the agents', or the owner's own. */
+#chooser {
+  position: absolute; z-index: 4; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  display: flex; flex-direction: column; gap: 10px; min-width: 240px; padding: 16px;
+  background: var(--ui-bg); border: 1px solid var(--ui-border); border-radius: 12px; text-align: center;
+}
+#chooser[hidden] { display: none; }
+#chooser p { margin: 0 0 4px; }
+#chooser button {
+  display: flex; flex-direction: column; gap: 2px; padding: 12px 16px; border: 1px solid var(--ui-border);
+  border-radius: 10px; background: transparent; color: var(--ui-fg); font: 17px var(--font); cursor: pointer;
+}
+#chooser button.last { border-color: var(--accent); }
+#chooser small { font-size: 13px; opacity: 0.7; }
+
+/* Windows, by desktop, each with a button that moves it to the other; and apps to open. */
+#wins, #apps {
+  position: absolute; z-index: 3; right: calc(6px + env(safe-area-inset-right));
+  top: calc(48px + env(safe-area-inset-top)); width: min(340px, calc(100% - 12px)); max-height: 60%;
+  overflow-y: auto; padding: 6px; background: var(--ui-bg); border: 1px solid var(--ui-border); border-radius: 10px;
+  -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
+}
+#wins[hidden], #apps[hidden] { display: none; }
+#wins h3, #apps h3 { margin: 6px 6px 2px; font-size: 13px; font-weight: normal; opacity: 0.7; }
+#wins .win, #apps .win { display: flex; align-items: center; gap: 8px; padding: 4px 6px; }
+#wins .win span, #apps .win span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#wins .win button, #apps .win button {
+  flex: none; padding: 4px 10px; border: 1px solid var(--ui-border); border-radius: 7px;
+  background: transparent; color: var(--ui-fg); font: 14px var(--font); cursor: pointer;
+}
+#wins p, #apps p { margin: 6px; opacity: 0.7; }
+
+/* Toolbar: top right, translucent, collapsible to its status dot and ⋯. */
+#bar {
+  position: absolute; z-index: 3;
+  top: calc(6px + env(safe-area-inset-top)); right: calc(6px + env(safe-area-inset-right));
+  display: flex; align-items: center; gap: 2px; padding: 3px;
+  background: var(--ui-bg); border: 1px solid var(--ui-border); border-radius: 10px;
+  -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
+  -webkit-user-select: none; user-select: none; touch-action: manipulation;
+}
+#tools { display: flex; gap: 2px; }
+#bar.collapsed #tools { display: none; }
+#bar button, #fit {
+  min-width: 32px; height: 30px; padding: 0 6px; border: 0; border-radius: 7px;
+  background: transparent; color: var(--ui-fg); font: 17px var(--font); line-height: 30px;
+  cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+#bar button:hover { background: rgba(255, 255, 255, 0.08); }
+#bar button[aria-pressed="true"] { background: var(--accent); color: #102014; }
+#dot { width: 10px; height: 10px; margin: 0 6px; border-radius: 50%; background: #888; flex: none; }
+#dot[data-state="ok"] { background: #6fd36f; }
+#dot[data-state="connecting"] { background: #e0b34a; animation: blink 1s ease-in-out infinite; }
+#dot[data-state="bad"] { background: #e5534b; }
+@keyframes blink { 50% { opacity: 0.35; } }
+
+#fit {
+  position: absolute; z-index: 3;
+  right: calc(10px + env(safe-area-inset-right)); bottom: calc(10px + env(safe-area-inset-bottom));
+  width: 40px; height: 40px; border-radius: 50%;
+  background: var(--ui-bg); border: 1px solid var(--ui-border);
+}
+#fit[hidden] { display: none; }
+
+#stats {
+  position: absolute; z-index: 3; left: calc(6px + env(safe-area-inset-left)); top: calc(6px + env(safe-area-inset-top));
+  padding: 6px 9px; border-radius: 8px; background: var(--ui-bg); border: 1px solid var(--ui-border);
+  font: 12px/1.45 ui-monospace, Menlo, monospace; white-space: pre; pointer-events: none;
+}
+#stats[hidden] { display: none; }
+
+/* Key bar: on touch screens while the keyboard is up, or when pinned. */
+#keys {
+  display: flex; gap: 3px; flex: none; overflow-x: auto;
+  padding: 4px calc(4px + env(safe-area-inset-right)) calc(4px + env(safe-area-inset-bottom)) calc(4px + env(safe-area-inset-left));
+  background: #0d130f; border-top: 1px solid var(--ui-border);
+  -webkit-user-select: none; user-select: none; touch-action: manipulation;
+}
+#keys[hidden] { display: none; }
+#keys button {
+  flex: 1 1 0; min-width: 34px; height: 38px; padding: 0 4px; white-space: nowrap;
+  font: 14px ui-monospace, Menlo, monospace; color: var(--ui-fg);
+  background: #1b2620; border: 1px solid #2d3d33; border-radius: 7px;
+  -webkit-tap-highlight-color: transparent;
+}
+#keys button[data-state="once"] { background: #3d5a2a; border-color: var(--accent); }
+#keys button[data-state="lock"] { background: var(--accent); color: #102014; border-color: var(--accent); }
+
+/* The phone keyboard's target: focusable, inside the viewport (so iOS does not scroll
+   to it), invisible, and 16px so iOS does not zoom when it takes focus. */
+#kbd {
+  position: fixed; left: 0; bottom: 0; width: 1px; height: 1px; padding: 0; border: 0;
+  opacity: 0; font-size: 16px; color: transparent; background: transparent; caret-color: transparent;
+  resize: none; overflow: hidden; z-index: -1;
+}
+
+@media (pointer: coarse) {
+  #bar button { min-width: 38px; height: 36px; line-height: 36px; font-size: 19px; }
+}

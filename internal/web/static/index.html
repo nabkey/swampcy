@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="theme-color" content="#000000">
+<title>swampcy</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <div id="stage">
+    <div id="view">
+      <video id="screen" autoplay muted playsinline disablepictureinpicture disableremoteplayback draggable="false"></video>
+    </div>
+    <div id="fx" aria-hidden="true"></div>
+    <div id="overlay" role="status" aria-live="polite">connecting…</div>
+    <div id="chooser" role="dialog" aria-label="which desktop" hidden>
+      <p>Which desktop?</p>
+      <button type="button" data-desk="agent">The agents'<small>see what they do, and help</small></button>
+      <button type="button" data-desk="own">Mine<small>sized to this screen</small></button>
+    </div>
+    <div id="wins" role="dialog" aria-label="windows" hidden></div>
+    <div id="apps" role="dialog" aria-label="apps" hidden></div>
+    <button id="fit" type="button" title="fit to screen" aria-label="fit to screen" hidden>⤢</button>
+  </div>
+
+  <div id="bar" role="toolbar" aria-label="swampcy">
+    <span id="dot" data-state="connecting" title="connection" aria-hidden="true"></span>
+    <div id="tools">
+      <button id="b-kbd" type="button" title="keyboard" aria-label="keyboard">⌨</button>
+      <button id="b-paste" type="button" title="paste your clipboard (⌘V on a keyboard)" aria-label="paste" hidden>📋</button>
+      <button id="b-fit" type="button" title="fit to screen" aria-label="fit to screen">⤢</button>
+      <button id="b-drag" type="button" title="drag mode: one finger always drags" aria-label="drag mode" aria-pressed="false">✥</button>
+      <button id="b-keys" type="button" title="key bar" aria-label="key bar" aria-pressed="false">⌥</button>
+      <button id="b-stats" type="button" title="stats" aria-label="stats" aria-pressed="false">ⓘ</button>
+      <button id="b-zoom" type="button" title="zoom: less is more room" aria-label="zoom" hidden>3×</button>
+      <button id="b-apps" type="button" title="open an app on your desktop" aria-label="apps" aria-pressed="false" hidden>⊕</button>
+      <button id="b-desk" type="button" title="switch desktop" aria-label="switch desktop" hidden>⇄</button>
+      <button id="b-wins" type="button" title="move windows between desktops" aria-label="windows" aria-pressed="false" hidden>▣</button>
+    </div>
+    <button id="b-more" type="button" title="tools" aria-label="tools" aria-expanded="true">⋯</button>
+  </div>
+  <div id="stats" hidden></div>
+
+  <div id="keys" role="toolbar" aria-label="extra keys" hidden>
+    <button type="button" data-key="1">Esc</button>
+    <button type="button" data-key="15">Tab</button>
+    <button type="button" data-mod="ctrl">Ctrl</button>
+    <button type="button" data-mod="alt">Alt</button>
+    <button type="button" data-mod="super">Super</button>
+    <button type="button" data-key="105" aria-label="left">←</button>
+    <button type="button" data-key="103" aria-label="up">↑</button>
+    <button type="button" data-key="108" aria-label="down">↓</button>
+    <button type="button" data-key="106" aria-label="right">→</button>
+    <button type="button" data-combo="ctrl" data-key="46">^C</button>
+    <button type="button" data-combo="ctrl" data-key="47">^V</button>
+    <button type="button" data-combo="ctrl" data-key="44">^Z</button>
+  </div>
+</div>
+<textarea id="kbd" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" inputmode="text" enterkeyhint="enter" aria-label="keyboard input" tabindex="-1"></textarea>
+<script type="module" src="app.js"></script>
+</body>
+</html>

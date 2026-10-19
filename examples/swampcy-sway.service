@@ -1,0 +1,17 @@
+# ~/.config/systemd/user/swampcy-sway.service
+# A headless sway that nobody sits at: the desktop swampcy lets the agents see and drive.
+[Unit]
+Description=swampcy: a headless sway desktop for the agents
+
+[Service]
+# No GPU and no input devices: software rendering, one virtual output.
+Environment=WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_HEADLESS_OUTPUTS=2 WLR_LIBINPUT_NO_DEVICES=1
+Environment=XDG_CURRENT_DESKTOP=sway XDG_SESSION_TYPE=wayland
+# Qt and Chromium expose their widgets to AT-SPI only when asked.
+Environment=QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 ACCESSIBILITY_ENABLED=1
+ExecStart=/usr/bin/sway --config %h/.config/swampcy/sway.conf
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

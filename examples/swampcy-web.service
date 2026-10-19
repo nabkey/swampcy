@@ -1,0 +1,16 @@
+# ~/.config/systemd/user/swampcy-web.service
+# The desktop in a browser: the page behind tailscale serve :8443, the picture over WebRTC on UDP 7683.
+[Unit]
+Description=swampcy web: the agents' desktop in a browser, behind tailscale serve
+After=swampcy-sway.service network-online.target
+Wants=swampcy-sway.service
+
+[Service]
+ExecStart=%h/.local/bin/swampcy web -login you@example.com -origin https://box.example.ts.net:8443 -own-output HEADLESS-2 -seat owner
+# swampcy itself, from ~/.local/bin; a user unit does not read ~/.bashrc.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
