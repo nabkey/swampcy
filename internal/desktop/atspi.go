@@ -94,6 +94,13 @@ func shownActions(actions []string) []string {
 	return out
 }
 
+// gtkClickLands is how long a GTK button takes to act on a click action. GTK
+// shows the button pressed for 250 ms (ACTIVATE_TIMEOUT in gtkbutton.c), emits
+// clicked only then, and ignores another activation until it has. Returning at
+// once let a second press of the same button vanish, and a screenshot taken
+// straight after showed the click not done yet.
+const gtkClickLands = 300 * time.Millisecond
+
 // preferredActions are tried in order when click_element names no action.
 var preferredActions = []string{"click", "press", "activate", "toggle", "jump", "open", "select", "switch"}
 
@@ -145,6 +152,9 @@ type A11y struct {
 	refs  map[string]Target
 	ids   map[accRef]string
 	next  int
+
+	toolkitMu sync.Mutex
+	toolkits  map[string]string // an application's bus name → its ToolkitName
 }
 
 // errNoAction is returned by Activate for an element that has no usable action,
@@ -623,7 +633,32 @@ func (a *A11y) Activate(ctx context.Context, ref, action string) (string, error)
 	if !ok {
 		return "", fmt.Errorf("%s refused %s", ref, n.actions[idx])
 	}
+	if strings.EqualFold(n.actions[idx], "click") && a.toolkit(ctx, conn, t.Elem.Bus) == "GTK" {
+		select {
+		case <-time.After(gtkClickLands):
+		case <-ctx.Done():
+		}
+	}
 	return n.actions[idx], nil
+}
+
+// toolkit is the ToolkitName of the application on a bus name, such as "GTK" or
+// "Qt", or "" when it does not say. It is asked once per application.
+func (a *A11y) toolkit(ctx context.Context, conn *dbus.Conn, bus string) string {
+	a.toolkitMu.Lock()
+	defer a.toolkitMu.Unlock()
+	if name, ok := a.toolkits[bus]; ok {
+		return name
+	}
+	var name string
+	if err := a.prop(ctx, conn, accRef{Bus: bus, Path: registryRoot.Path}, "org.a11y.atspi.Application", "ToolkitName", &name); err != nil {
+		return ""
+	}
+	if a.toolkits == nil {
+		a.toolkits = map[string]string{}
+	}
+	a.toolkits[bus] = name
+	return name
 }
 
 // Bounds is an element's rectangle in layout coordinates, worked out from where
