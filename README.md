@@ -21,8 +21,8 @@ my phone with `swampcy web`.
 - `at-spi2-core`, for the widget tools
 - `img2webp` (libwebp) or `ffmpeg`, for the `replay` tool's clips
 - for `swampcy web`: [Tailscale](https://tailscale.com) with HTTPS certificates on, and libaom
-  (AV1, x86-64 only) or OpenH264 (H.264) as shared libraries. swampcy loads them at run time
-  and needs no cgo; without them the MCP server still works.
+  (AV1) or OpenH264 (H.264) as shared libraries, on x86-64 or arm64. swampcy loads them at run
+  time and needs no cgo; without them the MCP server still works.
 
 The pointer and keyboard are swampcy's own: it holds a virtual pointer and keyboard on sway's
 seat, because a headless seat has none and apps ignore input without them, and it types on
@@ -73,8 +73,9 @@ loopback port can claim to be you.
 
 ## What doesn't work yet
 
-- AV1 is x86-64 only. libaom's structs are laid out by hand from the v3.13.3 headers, and a
-  library update that moves one makes swampcy refuse to encode until it is updated.
+- libaom's and OpenH264's structs are laid out by hand from their headers (libaom v3.13.3,
+  OpenH264 v2.6.0), and a library update that moves one makes swampcy refuse to encode until it
+  is updated. Both work on x86-64 and arm64 Linux.
 - One login, one viewer. A second browser tab ends the first.
 - Chrome binds only the first seat, so while you type into Chrome on your own desktop, an
   agent's keys go there too. Electron apps have the same problem and are not matched by
