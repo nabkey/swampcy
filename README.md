@@ -88,6 +88,8 @@ The full list is at the end of [docs/design.md](docs/design.md#known-limits).
 
 - GTK 4 reports its widgets' positions a few pixels off. `click_element` performs a widget's
   action instead of clicking where GTK says it is.
+- GTK buttons act on a click 250 ms late and ignore another press until then, so
+  `click_element` waits 300 ms after a click in a GTK app before it returns.
 - The apps run as you. A browser signed in on swampcy's screen lets every agent with swampcy act
   as you on those sites; sign in only to what you would hand the agent anyway.
 - swampcy itself opens no network port. If you run a VNC server instead of `swampcy web`, keep

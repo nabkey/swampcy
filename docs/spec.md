@@ -151,6 +151,9 @@ no session of its own and serves nothing on the network.
 - `click_element` MUST perform the named action, or the first of click, press, activate,
   toggle, jump, open, select, switch that the element offers. With `pointer`, or when the
   element has no action, it MUST click the centre of the element's current bounds instead.
+- After performing a `click` action in an application whose `ToolkitName` is GTK,
+  `click_element` MUST wait 300 ms before it returns, holding the input lock, so that the
+  click has landed and the next action cannot fall inside GTK's activation.
 - `set_text` MUST use EditableText's `SetTextContents`; `get_text` MUST return at most 20,000
   characters of Text and say how many more there were.
 

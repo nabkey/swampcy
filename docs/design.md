@@ -160,7 +160,7 @@ coordinates are meaningless. swampcy takes an element's extents in window coordi
 adds the window's client-area origin from sway's tree. It matches an AT-SPI application to a
 sway window by the D-Bus connection's process id, then by title.
 
-Two corrections follow from what toolkits actually report:
+Three corrections follow from what toolkits actually do:
 
 - **Chrome on Wayland draws a shadow around its window, even when tiled.** Its frame is its
   whole surface, about 10 pixels larger on every side than the window sway places, and its
@@ -170,6 +170,15 @@ Two corrections follow from what toolkits actually report:
   and gets some wrong: a few pixels to 12 pixels off in places. `click_element` therefore
   performs the widget's action rather than clicking its bounds. Only a click aimed from the
   outline (`pointer`) is affected.
+- **A GTK button acts on a click 250 ms after it is asked to.** Its activation shows the
+  button pressed for `ACTIVATE_TIMEOUT` (250 ms), emits `clicked` only then, and ignores
+  another activation in the meantime. `click_element` used to return at once, so an agent
+  pressing the same button twice in quick succession (calculator's "0" in "800", say) lost
+  the second press, whether the calls were parallel or one after the other: three presses
+  100 ms apart gave one digit. A screenshot taken straight after a click showed it not done
+  yet. After a click action in a GTK app, `click_element` now waits 300 ms before returning,
+  holding the input lock so the next action waits too. Other toolkits' actions are not
+  delayed.
 
 Chrome shows AT-SPI only its frame unless started with `--force-renderer-accessibility`, so
 `launch` adds that flag to Chrome and Chromium. `launch` also sets
@@ -492,6 +501,7 @@ on a machine anyone else can reach.
 - **Keymap swaps reach every app on the seat** when typing characters off the US keymap.
 - **An agent's pointer cannot leave its output.** It moves windows with `move_window`.
 - **GTK 4's widget bounds are a few pixels off.** Prefer `click_element`'s actions.
+- **A click action on a GTK app takes 300 ms**, waiting for GTK's button activation to finish.
 - **A seat can be left with no active keyboard** when a swampcy process exits, and Chrome
   crashes the next time it takes focus, until some swampcy types or launches something.
   `launch` guards against it; an app focused another way may not.
