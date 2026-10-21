@@ -19,7 +19,8 @@ import (
 // ISVCEncoder`), and every entry takes that object first. Its parameters are C
 // structs, which are kept here as byte buffers with the offsets of the fields swampcy
 // touches, computed for x86-64 (System V) from the v2.6.0 headers
-// (codec/api/wels/codec_app_def.h, codec_def.h). v2.5 has the same layout except
+// (codec/api/wels/codec_app_def.h, codec_def.h); arm64 Linux (AAPCS64) lays them
+// out the same way. v2.5 has the same layout except
 // SLayerBSInfo, which v2.6 grew by its rPsnr[3]; the library's own version picks
 // the stride.
 

@@ -16,6 +16,8 @@ import (
 // (aom/aom_image.h, aom/aom_codec.h, aom/aom_encoder.h, aom/aomcx.h; Fedora 44
 // ships 3.13.3) for x86-64 System V, and the realtime defaults the self-check
 // compares against are encoder_usage_cfg[] in av1/av1_cx_iface.c of the same tag.
+// arm64 Linux (AAPCS64) lays these structs out the same way; the self-check and
+// the encoder tests pass there too, against libaom 3.15.2.
 // A layout that does not match fails the self-check at open rather than
 // corrupting memory later.
 
