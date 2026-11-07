@@ -268,7 +268,7 @@ func (d *Desktop) click(ctx context.Context, in clickArgs) (*mcp.CallToolResult,
 	if count < 1 || count > 3 {
 		return nil, fmt.Errorf("count must be 1, 2 or 3")
 	}
-	if err := d.clickAt(x, y, button, count); err != nil {
+	if err := d.clickAt(g, x, y, button, count); err != nil {
 		return nil, err
 	}
 	return text("Clicked %s ×%d at (%d,%d).", button, count, in.X, in.Y), nil
@@ -282,10 +282,26 @@ const (
 	betweenClicks   = 60 * time.Millisecond
 )
 
-func (d *Desktop) clickAt(x, y int, button string, count int) error {
+// arrive moves the pointer to (x, y) by way of the pixel beside it, so the window
+// there always sees the pointer move onto it. A window that opens under a pointer
+// that has not moved gets no motion, and an XWayland app ignores the first press
+// that follows; moving to where the pointer already is sends nothing either. The
+// pixel beside it is on the same output, so no other screen sees the pointer.
+func (d *Desktop) arrive(g Geometry, x, y int) error {
+	nx := x - 1
+	if nx < g.Layout.X {
+		nx = x + 1
+	}
+	if err := d.Pointer.MoveTo(nx, y); err != nil {
+		return err
+	}
+	return d.Pointer.MoveTo(x, y)
+}
+
+func (d *Desktop) clickAt(g Geometry, x, y int, button string, count int) error {
 	d.input.Lock()
 	defer d.input.Unlock()
-	if err := d.Pointer.MoveTo(x, y); err != nil {
+	if err := d.arrive(g, x, y); err != nil {
 		return err
 	}
 	time.Sleep(settleAfterMove)
@@ -354,7 +370,7 @@ func (d *Desktop) drag(ctx context.Context, in dragArgs) (*mcp.CallToolResult, e
 	button := cmp.Or(in.Button, "left")
 	d.input.Lock()
 	defer d.input.Unlock()
-	if err := d.Pointer.MoveTo(x1, y1); err != nil {
+	if err := d.arrive(g, x1, y1); err != nil {
 		return nil, err
 	}
 	time.Sleep(settleAfterMove)
@@ -398,7 +414,7 @@ func (d *Desktop) scroll(ctx context.Context, in scrollArgs) (*mcp.CallToolResul
 	}
 	d.input.Lock()
 	defer d.input.Unlock()
-	if err := d.Pointer.MoveTo(x, y); err != nil {
+	if err := d.arrive(g, x, y); err != nil {
 		return nil, err
 	}
 	if err := d.Pointer.Scroll(in.Direction, amount); err != nil {
@@ -736,11 +752,14 @@ func (d *Desktop) clickElement(ctx context.Context, in elementArgs) (*mcp.CallTo
 	if err != nil {
 		return nil, err
 	}
-	x, y := r.X+r.Width/2, r.Y+r.Height/2
-	if err := d.clickAt(x, y, "left", 1); err != nil {
+	g, err := d.geometry()
+	if err != nil {
 		return nil, err
 	}
-	g, _ := d.geometry()
+	x, y := r.X+r.Width/2, r.Y+r.Height/2
+	if err := d.clickAt(g, x, y, "left", 1); err != nil {
+		return nil, err
+	}
 	s := g.ToShot(Rect{X: x, Y: y})
 	return text("Clicked the centre of %s at (%d,%d).", in.Ref, s.X, s.Y), nil
 }

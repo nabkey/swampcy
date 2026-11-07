@@ -163,7 +163,7 @@ func TestClickConvertsCoordinates(t *testing.T) {
 	if res.IsError {
 		t.Fatal(textOf(res))
 	}
-	want := []string{"move 200 100", "press left", "release left", "press left", "release left"}
+	want := []string{"move 199 100", "move 200 100", "press left", "release left", "press left", "release left"}
 	if !reflect.DeepEqual(f.events, want) {
 		t.Errorf("events = %q, want %q", f.events, want)
 	}
@@ -258,7 +258,7 @@ func TestElementTools(t *testing.T) {
 	if got := textOf(call(t, cs, "click_element", map[string]any{"ref": "e1"})); got != "Clicked the centre of e1 at (120,110)." {
 		t.Errorf("click_element without an action = %q", got)
 	}
-	if want := []string{"move 120 110", "press left", "release left"}; !reflect.DeepEqual(f.events, want) {
+	if want := []string{"move 119 110", "move 120 110", "press left", "release left"}; !reflect.DeepEqual(f.events, want) {
 		t.Errorf("events = %q, want %q", f.events, want)
 	}
 	if got := textOf(call(t, cs, "get_text", map[string]any{"ref": "e1"})); got != "hello" {
@@ -302,7 +302,8 @@ func TestOneOutputOfTwo(t *testing.T) {
 	if want := []string{"&{0 0 1280 800} 1.00", "&{2000 0 1600 900} 0.80"}; !reflect.DeepEqual(append(f.shots, f2.shots...), want) {
 		t.Errorf("captures = %q, want %q", append(f.shots, f2.shots...), want)
 	}
-	if !slices.Contains(f.events, "move 100 50") || !slices.Contains(f2.events, "move 2000 0") {
+	// At the second output's left edge the pointer arrives from the right, not from the first output.
+	if !slices.Contains(f.events, "move 100 50") || !slices.Equal(f2.events, []string{"move 2001 0", "move 2000 0", "press left", "release left"}) {
 		t.Errorf("moves = %q / %q, want 100,50 on the first and the second's origin", f.events, f2.events)
 	}
 	// The calculator is on HEADLESS-1: the second output's server says so.
