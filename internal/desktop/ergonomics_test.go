@@ -47,7 +47,7 @@ func TestClickWithModifiers(t *testing.T) {
 	f, _, d := newDesk(false)
 	cs := connect(t, d)
 	call(t, cs, "click", map[string]any{"x": 10, "y": 20, "modifiers": "ctrl+shift"})
-	want := []string{"move 10 20", "mods [ctrl shift] true", "press left", "release left", "mods [ctrl shift] false"}
+	want := []string{"move 9 20", "move 10 20", "mods [ctrl shift] true", "press left", "release left", "mods [ctrl shift] false"}
 	if !slices.Equal(f.events, want) {
 		t.Errorf("events = %q, want %q", f.events, want)
 	}
@@ -75,7 +75,7 @@ func TestMouseDownUpAndDragVia(t *testing.T) {
 	cs := connect(t, d)
 	call(t, cs, "mouse_down", map[string]any{"x": 5, "y": 5})
 	call(t, cs, "mouse_up", map[string]any{})
-	if want := []string{"move 5 5", "press left", "release left"}; !slices.Equal(f.events, want) {
+	if want := []string{"move 4 5", "move 5 5", "press left", "release left"}; !slices.Equal(f.events, want) {
 		t.Errorf("events = %q, want %q", f.events, want)
 	}
 	if res := call(t, cs, "mouse_down", map[string]any{}); !res.IsError {
@@ -98,7 +98,7 @@ func TestBatchRunsInOrderAndStopsAtAFailure(t *testing.T) {
 		map[string]any{"tool": "type", "args": map[string]any{"text": "hi"}},
 		map[string]any{"tool": "key", "args": map[string]any{"keys": "Return"}},
 	}})
-	want := []string{"move 10 10", "press left", "release left", `type "hi"`, "keys [{[] Return}]"}
+	want := []string{"move 9 10", "move 10 10", "press left", "release left", `type "hi"`, "keys [{[] Return}]"}
 	if !slices.Equal(f.events, want) {
 		t.Errorf("events = %q, want %q", f.events, want)
 	}

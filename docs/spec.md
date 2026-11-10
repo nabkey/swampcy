@@ -110,6 +110,9 @@ no session of its own and serves nothing on the network.
   buttons as evdev codes, and wheel clicks as discrete axis events, each followed by a frame.
 - `click` MUST pause about 20 ms after moving, hold each button about 40 ms, and leave about
   60 ms between repeated clicks: GTK 4 ignores a press and release with no time between them.
+- `click`, `drag` and `scroll` MUST bring the pointer to their point from the pixel beside it
+  on the same output, so the window there sees it move: a window that opens under a still
+  pointer gets no motion, and an XWayland app then ignores the first press.
 - `type` MUST type on swampcy's own virtual keyboard, so that the text lands on its seat. A
   character on the US keymap MUST be typed as that key, with Shift when it needs it, unless
   a modifier is held. Any other text MUST be typed by giving the keyboard a keymap that holds

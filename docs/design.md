@@ -100,6 +100,11 @@ seat whose last active keyboard has gone leaves apps with modifiers and no keyma
 crashes on that. So swampcy makes its keyboard active as soon as its keymap is set, and
 presses a lone modifier before it launches an app.
 
+Every click, drag and scroll arrives at its point from the pixel beside it. A window that
+opens under a pointer that has not moved is never told the pointer is there, and moving to
+where the pointer already is sends nothing. Native Wayland apps take the press anyway; an
+XWayland app ignores the first one, so an agent's first click on a new dialog was lost.
+
 ## Typing on its own keyboard
 
 swampcy first typed through wtype, which loads a keymap holding whatever characters it is
