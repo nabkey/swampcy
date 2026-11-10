@@ -77,7 +77,9 @@ func main() {
 		// The seat has no pointer or keyboard until these exist.
 		log.Warn("no virtual pointer and keyboard yet", "err", err)
 	}
-	d := &desktop.Desktop{Sway: live, Screen: live, Pointer: live, Keyboard: live, Launch: live.Launch, MaxEdge: *maxEdge, Output: *output, Log: log}
+	d := &desktop.Desktop{Sway: live, Screen: live, Pointer: live, Keyboard: live, Launch: live.Launch, MaxEdge: *maxEdge, Output: *output, Log: log,
+		Exited: live.Exited, Settle: live.Settle, LockInput: live.LockInput,
+		ClipboardText: live.ClipboardText, SetClipboardText: live.SetClipboardText}
 
 	if *replay {
 		d.Replay = &desktop.Replay{Screen: live, Dir: *replayDir, Width: *replayWidth, Size: *replayFrames, Keep: *replayKeep,

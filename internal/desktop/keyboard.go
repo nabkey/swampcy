@@ -174,6 +174,65 @@ func (v *VirtualInput) Keys(combos []Combo, delay time.Duration) error {
 	return nil
 }
 
+// HoldMods presses (or releases) modifier keys and leaves them so, for a click or
+// a scroll made while they are held.
+func (v *VirtualInput) HoldMods(mods []string, down bool) error {
+	for _, m := range mods {
+		if _, ok := modCodes[m]; !ok {
+			return fmt.Errorf("unknown modifier %q", m)
+		}
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	for _, m := range mods {
+		if err := v.key(modCodes[m].code, down); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// HoldKey holds a combination down for d, so the app repeats it or sees it held.
+// Only keys of the US keymap can be held: any other is typed on a keymap of its
+// own, which cannot stay while other things happen.
+func (v *VirtualInput) HoldKey(c Combo, d time.Duration) error {
+	k, ok := usKeysyms[c.Key]
+	if !ok {
+		return fmt.Errorf("%q cannot be held: only keys of the US keymap can", c.Key)
+	}
+	codes := []uint32{}
+	for _, m := range c.Mods {
+		mc, ok := modCodes[m]
+		if !ok {
+			return fmt.Errorf("unknown modifier %q", m)
+		}
+		codes = append(codes, mc.code)
+	}
+	if k.shift && !slices.Contains(codes, 42) {
+		codes = append(codes, 42)
+	}
+	codes = append(codes, k.code)
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	var first error
+	for _, code := range codes {
+		if first = v.key(code, true); first != nil {
+			break
+		}
+	}
+	if first == nil {
+		time.Sleep(d)
+	}
+	for i := len(codes) - 1; i >= 0; i-- {
+		if v.keys[codes[i]] {
+			if err := v.key(codes[i], false); first == nil {
+				first = err
+			}
+		}
+	}
+	return first
+}
+
 // tapUS presses and releases a key of the US keymap, with Shift if it needs it
 // and the modifier keys mods held around it.
 func (v *VirtualInput) tapUS(k usKey, mods []uint32, delay time.Duration) error {

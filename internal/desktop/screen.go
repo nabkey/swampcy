@@ -68,6 +68,7 @@ type Geometry struct {
 	Layout Rect    // the output's rectangle in sway's layout
 	Scale  float64 // screenshot pixels per layout pixel, at most 1
 	Output string  // the output's name, when known
+	Native float64 // the output's own scale: device pixels per layout pixel
 }
 
 // NewGeometry fits the layout into maxEdge pixels on its long edge.

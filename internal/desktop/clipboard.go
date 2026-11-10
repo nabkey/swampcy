@@ -3,7 +3,11 @@ package desktop
 import (
 	"encoding/binary"
 	"errors"
+	"io"
+	"os"
+	"slices"
 	"sync"
+	"time"
 )
 
 // Clipboard owns a seat's selection, the clipboard Ctrl+V pastes from, through
@@ -30,8 +34,13 @@ const (
 	dcSourceSend      = 0 // event
 	dcSourceCancelled = 1 // event
 	// zwlr_data_control_offer_v1
+	dcOfferReceive = 0
 	dcOfferDestroy = 1
+	dcOfferOffer   = 0 // event
 )
+
+// maxClipboard bounds what Text reads from the selection's owner.
+const maxClipboard = 1 << 20
 
 // textMimeTypes are what a text selection is offered as: the MIME types GTK, Qt and
 // Chromium ask for, and the X11 targets XWayland apps do.
@@ -44,6 +53,12 @@ type Clipboard struct {
 
 	mu  sync.Mutex
 	err error // the device went away (finished)
+	// The seat's selection as last announced: its offer object and the MIME types
+	// it comes in. pending holds the types of offers announced but not yet named
+	// as the selection.
+	offer   uint32
+	mimes   []string
+	pending map[uint32][]string
 }
 
 // OpenClipboard connects to the session and takes a data-control device on the
@@ -72,14 +87,38 @@ func (c *Clipboard) open(seat string) error {
 	}
 	c.device = w.alloc()
 	// The device tells this client about every selection on the seat, each as a new
-	// offer object. None is read here, so each is destroyed once the selection
-	// event names it, rather than left to pile up in the compositor.
+	// offer object followed by its MIME types. The current one is kept for Text to
+	// read; the one it replaces is destroyed, rather than left to pile up in the
+	// compositor.
+	c.pending = map[uint32][]string{}
 	w.handle(c.device, func(op uint16, body []byte) {
 		switch op {
+		case dcDeviceDataOffer:
+			if len(body) >= 4 {
+				offer := binary.NativeEndian.Uint32(body)
+				c.mu.Lock()
+				c.pending[offer] = nil
+				c.mu.Unlock()
+				w.handle(offer, func(op uint16, body []byte) {
+					if op == dcOfferOffer {
+						mime, _ := wireString(body)
+						c.mu.Lock()
+						c.pending[offer] = append(c.pending[offer], mime)
+						c.mu.Unlock()
+					}
+				})
+			}
 		case dcDeviceSelection:
 			if len(body) >= 4 {
-				if offer := binary.NativeEndian.Uint32(body); offer != 0 {
-					_ = w.send(offer, dcOfferDestroy, nil)
+				offer := binary.NativeEndian.Uint32(body)
+				c.mu.Lock()
+				old := c.offer
+				c.offer, c.mimes = offer, c.pending[offer]
+				delete(c.pending, offer)
+				c.mu.Unlock()
+				if old != 0 && old != offer {
+					w.handle(old, nil)
+					_ = w.send(old, dcOfferDestroy, nil)
 				}
 			}
 		case dcDeviceFinished:
@@ -133,6 +172,52 @@ func (c *Clipboard) SetText(text string) error {
 		return err
 	}
 	return w.roundtrip()
+}
+
+// Text reads the seat's selection as text: what Ctrl+V would paste. It is empty
+// when nothing is selected or the selection is not text.
+func (c *Clipboard) Text() (string, error) {
+	if err := c.Err(); err != nil {
+		return "", err
+	}
+	if err := c.w.roundtrip(); err != nil { // so a selection just set has been announced
+		return "", err
+	}
+	c.mu.Lock()
+	offer, mimes := c.offer, c.mimes
+	c.mu.Unlock()
+	if offer == 0 {
+		return "", nil
+	}
+	mime := ""
+	for _, m := range textMimeTypes {
+		if slices.Contains(mimes, m) {
+			mime = m
+			break
+		}
+	}
+	if mime == "" {
+		return "", nil
+	}
+	r, wr, err := os.Pipe()
+	if err != nil {
+		return "", err
+	}
+	defer r.Close()
+	err = c.w.send(offer, dcOfferReceive, wr, mime)
+	wr.Close() // the owner holds the other copy, and closes it when it has written
+	if err != nil {
+		return "", err
+	}
+	if err := c.w.roundtrip(); err != nil {
+		return "", err
+	}
+	_ = r.SetReadDeadline(time.Now().Add(3 * time.Second))
+	data, err := io.ReadAll(io.LimitReader(r, maxClipboard))
+	if err != nil && len(data) == 0 {
+		return "", errors.New("clipboard: the selection's owner sent nothing")
+	}
+	return string(data), nil
 }
 
 // Err is why the clipboard stopped working (the session or its device went away),

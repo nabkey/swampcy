@@ -1,9 +1,12 @@
 package desktop
 
 import (
+	"cmp"
 	"context"
 	"log/slog"
+	"os"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -28,6 +31,24 @@ type Live struct {
 	in      *VirtualInput
 	inSess  Session
 	inPlace InputPlace
+
+	clipMu   sync.Mutex
+	clip     *Clipboard
+	clipSess Session
+
+	capMu   sync.Mutex
+	cap     *Capture
+	capSess Session
+	capOut  string
+
+	exitMu sync.Mutex
+	exits  map[int]Exit
+}
+
+// Exit is how a launched command's shell ended, and what it had written.
+type Exit struct {
+	Err    error
+	Output string
 }
 
 // Session returns the current session, discovering it if needed.
@@ -214,5 +235,161 @@ func (l *Live) Launch(command string) (int, error) {
 	if logPath == "" {
 		logPath = s.RuntimeDir + "/swampcy/apps.log"
 	}
-	return Launcher{Env: s.Env(), LogPath: logPath, Log: l.Log}.Start(command)
+	return Launcher{Env: s.Env(), LogPath: logPath, Log: l.Log, Exited: func(pid int, err error, output string) {
+		l.exitMu.Lock()
+		defer l.exitMu.Unlock()
+		if l.exits == nil || len(l.exits) > 256 {
+			l.exits = map[int]Exit{}
+		}
+		l.exits[pid] = Exit{Err: err, Output: output}
+	}}.Start(command)
+}
+
+// Exited reports whether the shell of a command Launch started has exited, and how.
+func (l *Live) Exited(pid int) (Exit, bool) {
+	l.exitMu.Lock()
+	defer l.exitMu.Unlock()
+	e, ok := l.exits[pid]
+	return e, ok
+}
+
+func (l *Live) HoldMods(ctx context.Context, mods []string, down bool) error {
+	in, err := l.Input()
+	if err != nil {
+		return err
+	}
+	return in.HoldMods(mods, down)
+}
+
+func (l *Live) HoldKey(ctx context.Context, c Combo, d time.Duration) error {
+	in, err := l.Input()
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return in.HoldKey(c, d)
+}
+
+// clipboard is the data-control device on l's seat, opened when first needed and
+// again when the session is new. A selection set through it lasts as long as it does.
+func (l *Live) clipboard() (*Clipboard, error) {
+	s, err := l.Session()
+	if err != nil {
+		return nil, err
+	}
+	l.clipMu.Lock()
+	defer l.clipMu.Unlock()
+	if l.clip != nil && l.clip.Err() == nil && l.clipSess == s {
+		return l.clip, nil
+	}
+	if l.clip != nil {
+		l.clip.Close()
+	}
+	c, err := OpenClipboard(s, l.Seat)
+	if err != nil {
+		l.clip = nil
+		return nil, err
+	}
+	l.clip, l.clipSess = c, s
+	return c, nil
+}
+
+// ClipboardText reads the seat's clipboard.
+func (l *Live) ClipboardText() (string, error) {
+	c, err := l.clipboard()
+	if err != nil {
+		return "", err
+	}
+	return c.Text()
+}
+
+// SetClipboardText puts text on the seat's clipboard.
+func (l *Live) SetClipboardText(text string) error {
+	c, err := l.clipboard()
+	if err != nil {
+		return err
+	}
+	return c.SetText(text)
+}
+
+// Settle waits until l's screen has gone quiet without a change, or most has
+// passed: screencopy reports each change as it is drawn, so a screen that an
+// action left redrawing is waited out, and one that did not change costs quiet.
+// It reports whether the screen went quiet.
+func (l *Live) Settle(ctx context.Context, quiet, most time.Duration) bool {
+	deadline := time.Now().Add(most)
+	s, err := l.Session()
+	if err != nil {
+		return false
+	}
+	out, err := l.Screen()
+	if err != nil {
+		return false
+	}
+	l.capMu.Lock()
+	defer l.capMu.Unlock()
+	if l.cap == nil || l.cap.Err() != nil || l.capSess != s || l.capOut != out.Name {
+		if l.cap != nil {
+			l.cap.Close()
+		}
+		if l.cap, err = OpenCapture(s, out.Name); err != nil {
+			l.cap = nil
+			return false
+		}
+		l.capSess, l.capOut = s, out.Name
+	}
+	for {
+		left := time.Until(deadline)
+		if left <= 0 {
+			return false
+		}
+		cctx, cancel := context.WithTimeout(ctx, min(quiet, left))
+		_, err := l.cap.Next(cctx)
+		cancel()
+		switch {
+		case err == nil:
+			continue // something changed: wait for quiet again
+		case ctx.Err() != nil:
+			return false
+		case l.cap.Err() != nil:
+			l.cap.Close()
+			l.cap = nil
+			return false
+		default:
+			return left >= quiet // quiet passed without a change
+		}
+	}
+}
+
+// LockInput takes the seat's input lock, shared by every swampcy on the session,
+// so that two agents' clicks and keys do not interleave. It gives up after ten
+// seconds and goes ahead: a lock is not worth a hung tool.
+func (l *Live) LockInput() func() {
+	s, err := l.Session()
+	if err != nil {
+		return nil
+	}
+	dir := s.RuntimeDir + "/swampcy"
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil
+	}
+	f, err := os.OpenFile(dir+"/input-"+cmp.Or(l.Seat, "seat")+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil
+	}
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+			return func() { f.Close() } // closing releases it
+		}
+		if time.Now().After(deadline) {
+			if l.Log != nil {
+				l.Log.Warn("input lock held by another swampcy for 10s; going ahead without it")
+			}
+			f.Close()
+			return nil
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }

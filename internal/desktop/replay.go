@@ -73,6 +73,7 @@ const (
 var actingTools = map[string]bool{
 	"click": true, "click_element": true, "key": true, "type": true,
 	"scroll": true, "launch": true, "drag": true, "set_text": true,
+	"mouse_down": true, "mouse_up": true, "set_value": true, "scroll_to": true, "close_window": true,
 }
 
 // clipName is what a clip's name must look like: it becomes a file name, and a
