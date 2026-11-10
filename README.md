@@ -43,13 +43,20 @@ switched on.
 
 | Tool | |
 | --- | --- |
-| `screenshot`, `zoom` | the whole screen, or a region at full resolution |
-| `click`, `move`, `drag`, `scroll` | the pointer, in screenshot pixels |
-| `type`, `key` | any Unicode text; keys and shortcuts like `ctrl+s` |
-| `windows`, `focus_window`, `move_window`, `launch` | sway's windows, and starting apps |
-| `accessibility_tree`, `find_elements` | widgets, each with a ref like `e12` |
-| `click_element`, `set_text`, `get_text` | act on a widget by ref |
+| `screenshot`, `zoom` | the whole screen, or a region magnified |
+| `click`, `move`, `drag`, `scroll` | the pointer, in screenshot pixels; `modifiers` for ctrl- and shift-clicks |
+| `mouse_down`, `mouse_up` | a button held across other steps |
+| `type`, `key` | any Unicode text; keys and shortcuts like `ctrl+s`, repeated or held |
+| `clipboard_get`, `clipboard_set` | the clipboard's text |
+| `windows`, `focus_window`, `move_window`, `close_window`, `launch` | sway's windows, and starting apps |
+| `accessibility_tree`, `find_elements` | widgets, each with a ref like `e12`; popups and off-screen ones too |
+| `click_element`, `set_text`, `get_text`, `set_value`, `scroll_to` | act on a widget by ref |
+| `wait`, `wait_for` | until a widget or a window is there, or gone |
+| `batch` | several of the above in one call |
 | `replay` | an animated clip of what the agent did, saved under `-replay-dir` |
+
+Every tool that acts takes `screenshot: true`, which waits for the screen to stop changing and
+returns it with the result, so seeing what a click did is not a second call.
 
 Coordinates are always pixels of swampcy's screenshots, which are scaled to at most 1568 on the
 long edge (`-max-edge`); swampcy converts them to the screen's.
@@ -89,6 +96,9 @@ The full list is at the end of [docs/design.md](docs/design.md#known-limits).
 
 - GTK 4 reports its widgets' positions a few pixels off. `click_element` performs a widget's
   action instead of clicking where GTK says it is.
+- Several swampcy servers on one seat take turns: a lock file in `$XDG_RUNTIME_DIR/swampcy`
+  keeps one agent's clicks and keys from landing between another's. They still share one
+  screen and one focus.
 - GTK buttons act on a click 250 ms late and ignore another press until then, so
   `click_element` waits 300 ms after a click in a GTK app before it returns.
 - The apps run as you. A browser signed in on swampcy's screen lets every agent with swampcy act

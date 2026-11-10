@@ -190,8 +190,9 @@ func (f *fakeCompositor) serve(t *testing.T, c *net.UnixConn) {
 				// The seat's new selection is announced to the device as an offer
 				// (0xff000001: a server-made id), then an app pastes it: the source is
 				// sent a pipe and the text read back from it.
-				write(obj, dcDeviceDataOffer, words(0xff000001))
-				write(obj, dcDeviceSelection, words(0xff000001))
+				offer := uint32(0xff000000 + len(f.sources))
+				write(obj, dcDeviceDataOffer, words(offer))
+				write(obj, dcDeviceSelection, words(offer))
 				var p [2]int
 				if err := syscall.Pipe(p[:]); err == nil {
 					body := str(nil, "text/plain;charset=utf-8")
@@ -458,9 +459,10 @@ func TestClipboard(t *testing.T) {
 		t.Errorf("destroyed: first %d, second %d; want 1 and 0",
 			len(f.find(sources[0], dcSourceDestroy)), len(f.find(sources[1], dcSourceDestroy)))
 	}
-	// The offers the device was told about are not left in the compositor.
-	if n := len(f.find(0xff000001, dcOfferDestroy)); n != 2 {
-		t.Errorf("offer destroyed %d times, want once per selection", n)
+	// The offer a new selection replaced is not left in the compositor; the
+	// current one is kept, for Text to read.
+	if a, b := len(f.find(0xff000001, dcOfferDestroy)), len(f.find(0xff000002, dcOfferDestroy)); a != 1 || b != 0 {
+		t.Errorf("offers destroyed: first %d, second %d; want 1 and 0", a, b)
 	}
 	// On the seat asked for.
 	f.mu.Lock()

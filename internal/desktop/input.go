@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -20,6 +21,23 @@ type Pointer interface {
 type Keyboard interface {
 	Type(ctx context.Context, text string) error
 	Keys(ctx context.Context, combos []Combo) error
+	// HoldMods presses or releases modifiers (Combo's names) and leaves them so.
+	HoldMods(ctx context.Context, mods []string, down bool) error
+	// HoldKey holds one combination down for d.
+	HoldKey(ctx context.Context, c Combo, d time.Duration) error
+}
+
+// ParseMods reads modifiers like "ctrl" or "ctrl+shift" into Combo's names.
+func ParseMods(s string) ([]string, error) {
+	var out []string
+	for _, p := range strings.FieldsFunc(s, func(r rune) bool { return r == '+' || r == ' ' || r == ',' }) {
+		m, ok := modNames[strings.ToLower(p)]
+		if !ok {
+			return nil, fmt.Errorf("unknown modifier %q (use ctrl, shift, alt or super)", p)
+		}
+		out = append(out, m)
+	}
+	return out, nil
 }
 
 // Combo is one key with the modifiers held while it is pressed: modifiers ctrl,

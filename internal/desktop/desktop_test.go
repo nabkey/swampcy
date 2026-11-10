@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -48,6 +49,15 @@ func (f *fakeDesk) Keys(_ context.Context, cs []Combo) error {
 	return nil
 }
 
+func (f *fakeDesk) HoldMods(_ context.Context, mods []string, down bool) error {
+	f.log("mods %v %v", mods, down)
+	return nil
+}
+func (f *fakeDesk) HoldKey(_ context.Context, c Combo, d time.Duration) error {
+	f.log("hold %v %s", c, d)
+	return nil
+}
+
 func (f *fakeDesk) Capture(_ context.Context, r *Rect, scale float64) ([]byte, string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -58,13 +68,27 @@ func (f *fakeDesk) Capture(_ context.Context, r *Rect, scale float64) ([]byte, s
 type fakeA11y struct {
 	activateErr error
 	bounds      Rect
+	finds       int
+	findAfter   int // Find matches nothing until its findAfter'th call
 }
 
 func (f *fakeA11y) Tree(_ context.Context, w Window, _ Geometry, o TreeOptions) (string, error) {
 	return fmt.Sprintf("tree of %d depth %d nodes %d", w.ID, o.MaxDepth, o.MaxNodes), nil
 }
-func (f *fakeA11y) Find(_ context.Context, ws []Window, _ Geometry, q Query, _ TreeOptions) (string, error) {
-	return fmt.Sprintf("find %q %q in %d windows, limit %d", q.Name, q.Role, len(ws), q.Limit), nil
+func (f *fakeA11y) Find(_ context.Context, ws []Window, _ Geometry, q Query, o TreeOptions) (string, int, error) {
+	f.finds++
+	n := 1
+	if f.findAfter > 0 && f.finds < f.findAfter {
+		n = 0
+	}
+	return fmt.Sprintf("find %q %q in %d windows, limit %d all %v", q.Name, q.Role, len(ws), q.Limit, o.All), n, nil
+}
+func (f *fakeA11y) ScrollTo(context.Context, string) error { return nil }
+func (f *fakeA11y) SetValue(_ context.Context, _ string, v float64) (string, error) {
+	return fmt.Sprintf("%g (0..100)", v), nil
+}
+func (f *fakeA11y) Line(_ context.Context, ref string, _ *Node, _ Geometry) (string, error) {
+	return ref + " button \"OK\" (10,10 20x20)", nil
 }
 func (f *fakeA11y) Activate(_ context.Context, ref, action string) (string, error) {
 	if f.activateErr != nil {
@@ -132,7 +156,8 @@ func TestToolsAreListed(t *testing.T) {
 		names = append(names, tool.Name)
 	}
 	want := []string{"screenshot", "zoom", "click", "move", "drag", "scroll", "type", "key", "windows", "focus_window",
-		"move_window", "launch", "accessibility_tree", "find_elements", "click_element", "set_text", "get_text"}
+		"move_window", "launch", "accessibility_tree", "find_elements", "click_element", "set_text", "get_text",
+		"mouse_down", "mouse_up", "wait", "wait_for", "batch", "close_window", "scroll_to", "set_value"}
 	if len(names) != len(want) {
 		t.Errorf("tools = %v, want %v", names, want)
 	}
@@ -196,10 +221,12 @@ func TestZoom(t *testing.T) {
 	if res.IsError {
 		t.Fatal(textOf(res))
 	}
-	if want := []string{"&{200 200 400 200} 1.00"}; !reflect.DeepEqual(f.shots, want) {
+	// Half-size screenshots of a 2560-wide layout: the region is magnified three
+	// times over the screenshot, which is 1.5 layout pixels to one.
+	if want := []string{"&{200 200 400 200} 1.50"}; !reflect.DeepEqual(f.shots, want) {
 		t.Errorf("captures = %q, want %q", f.shots, want)
 	}
-	if !strings.Contains(textOf(res), "2.0x") {
+	if !strings.Contains(textOf(res), "3.0x") || !strings.Contains(textOf(res), "enlarged") {
 		t.Errorf("summary = %q", textOf(res))
 	}
 }
@@ -244,7 +271,7 @@ func TestElementTools(t *testing.T) {
 	if got := textOf(call(t, cs, "accessibility_tree", nil)); got != "tree of 7 depth 25 nodes 400" {
 		t.Errorf("tree of the focused window = %q", got)
 	}
-	if got := textOf(call(t, cs, "find_elements", map[string]any{"name": "equals"})); got != `find "equals" "" in 3 windows, limit 30` {
+	if got := textOf(call(t, cs, "find_elements", map[string]any{"name": "equals"})); got != `find "equals" "" in 3 windows, limit 30 all false` {
 		t.Errorf("find = %q", got)
 	}
 	if res := call(t, cs, "find_elements", nil); !res.IsError {

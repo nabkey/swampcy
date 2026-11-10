@@ -14,6 +14,7 @@ the design has known limits.
 - [A named seat and a named output](#a-named-seat-and-a-named-output)
 - [Coordinates and screenshots](#coordinates-and-screenshots)
 - [Accessibility through AT-SPI](#accessibility-through-at-spi)
+- [Fewer round trips](#fewer-round-trips)
 - [Dependencies](#dependencies)
 - [Two desktops on two seats](#two-desktops-on-two-seats)
 - [The web viewer](#the-web-viewer)
@@ -186,11 +187,44 @@ Three corrections follow from what toolkits actually do:
   delayed.
 
 Chrome shows AT-SPI only its frame unless started with `--force-renderer-accessibility`, so
-`launch` adds that flag to Chrome and Chromium. `launch` also sets
+`launch` adds that flag to Chrome and Chromium. Three more things about Chrome's tree, found
+by reading it rather than assuming:
+
+- **Its actions have names only through `GetName`.** `GetActions` returns them empty, so the
+  outline once ended every line in `actions: ,` and `click_element` fell back to the pointer.
+- **A scrolled page's wrappers are "not showing".** The outermost section keeps the box it
+  had at the top of the page, so skipping what is not showing skipped the whole page once it
+  had been scrolled. Inside a web document swampcy looks into such containers.
+- **Its bubbles are siblings of the window's frame**, not children and not windows in sway's
+  tree, with positions counted from the main window's surface. They are outlined first.
+
+With the repeats and the per-element noise left out, a Wikipedia article's visible outline
+went from about 9,600 tokens to about 3,800. `launch` also sets
 `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1` and `ACCESSIBILITY_ENABLED=1`, and swampcy turns
 `org.a11y.Status.IsEnabled` on at start. Apps started another way may have no tree.
 
 Every D-Bus call has a timeout, so a hung app cannot hang a tool.
+
+## Fewer round trips
+
+Each tool call is a turn of the model, and that turn, not the tool, is where an agent's time
+goes. The first tools made every step two turns (act, then `screenshot`), and a screenshot
+taken straight after an action often showed the screen before it had answered. Three things
+cut that, measured on a scripted task (open Chrome, go to a page, see it): six calls ending
+on a screenshot of the still-blank page became three ending on the page.
+
+- **`screenshot: true` on the action.** The picture comes back with the result, taken once
+  the screen has stopped changing. Screencopy's `copy_with_damage` already tells swampcy when
+  something is drawn, so "settled" is 200 ms without damage, not a guessed sleep. It is asked
+  for, not the default: most steps need no look, and an image is some 1,300 tokens.
+- **`batch`.** Steps that need no look in between (focus a field, type, press Return) go in
+  one call, under one hold of the input lock.
+- **`wait_for`.** A page load or a dialog is waited for by name, in the server, instead of
+  by screenshots in a loop.
+
+The input lock is a `flock` shared by every swampcy on the seat. Without it two agents
+typing at once produced `babababa…`; with it, one's text and then the other's. It does not
+give each agent a screen or a focus of its own: they still share both.
 
 ## Dependencies
 
@@ -202,6 +236,8 @@ cannot do the job safely:
 - `github.com/modelcontextprotocol/go-sdk`, chosen over a JSON-RPC loop on the standard
   library, which could have done the job. The SDK keeps up with the protocol's versions and
   infers and checks the tools' input schemas.
+- `github.com/google/jsonschema-go`, which the SDK already brings: `batch` checks each
+  step's arguments against the same schema the SDK checks a direct call against.
 - `github.com/pion/webrtc/v4` and `github.com/pion/interceptor`, for `swampcy web`: the
   standard library has no ICE, DTLS, SRTP, SCTP, RTP packetisation or congestion control.
 - `github.com/ebitengine/purego`, to call libaom and OpenH264 at run time without cgo.
@@ -504,6 +540,11 @@ on a machine anyone else can reach.
 - **Software encoding through hand-checked C struct offsets.** A library update that moves a
   layout makes swampcy refuse to encode until it is updated.
 - **Keymap swaps reach every app on the seat** when typing characters off the US keymap.
+- **A selection `clipboard_set` made is gone when that swampcy exits**, since a Wayland
+  selection lives in the client that set it and the example session runs no clipboard manager.
+- **A popup is outlined with every window of its app**, since AT-SPI does not say which one
+  it belongs to; with two Chrome windows its bounds are right for only one.
+- **`find_elements` with `all` reads the whole tree**: about 2.5 s for a long article.
 - **An agent's pointer cannot leave its output.** It moves windows with `move_window`.
 - **GTK 4's widget bounds are a few pixels off.** Prefer `click_element`'s actions.
 - **A click action on a GTK app takes 300 ms**, waiting for GTK's button activation to finish.

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -15,6 +16,9 @@ type Launcher struct {
 	Env     []string
 	LogPath string
 	Log     *slog.Logger
+	// Exited, when set, is told when the command's shell exits, with what it wrote
+	// to the log (its tail), so a command that failed at once can be reported.
+	Exited func(pid int, err error, output string)
 }
 
 // Start runs command with sh -c and returns its pid.
@@ -22,6 +26,7 @@ func (l Launcher) Start(command string) (int, error) {
 	cmd := exec.Command("/bin/sh", "-c", command)
 	cmd.Env = l.Env
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	var offset int64
 	if l.LogPath != "" {
 		if err := os.MkdirAll(filepath.Dir(l.LogPath), 0o700); err != nil {
 			return 0, err
@@ -32,6 +37,9 @@ func (l Launcher) Start(command string) (int, error) {
 		}
 		defer f.Close() // the child keeps its own copy
 		fmt.Fprintf(f, "--- %s\n", command)
+		if fi, err := f.Stat(); err == nil {
+			offset = fi.Size()
+		}
 		cmd.Stdout, cmd.Stderr = f, f
 	}
 	if err := cmd.Start(); err != nil {
@@ -43,6 +51,33 @@ func (l Launcher) Start(command string) (int, error) {
 		if l.Log != nil {
 			l.Log.Info("launched app exited", "pid", pid, "err", err)
 		}
+		if l.Exited != nil {
+			l.Exited(pid, err, logTail(l.LogPath, offset))
+		}
 	}()
 	return pid, nil
+}
+
+// logTail is what was appended to the log after offset, at most its last 1500
+// bytes. Other apps write to the same log, so it may hold their lines too.
+func logTail(path string, offset int64) string {
+	if path == "" {
+		return ""
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil || fi.Size() <= offset {
+		return ""
+	}
+	const most = 1500
+	if fi.Size()-offset > most {
+		offset = fi.Size() - most
+	}
+	buf := make([]byte, fi.Size()-offset)
+	n, _ := f.ReadAt(buf, offset)
+	return strings.TrimSpace(string(buf[:n]))
 }

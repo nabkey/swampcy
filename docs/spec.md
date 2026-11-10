@@ -45,9 +45,17 @@ no session of its own and serves nothing on the network.
 - `screenshot` MUST return the image as MCP image content, followed by text giving its size,
   the layout's size when it was scaled, and the focused window.
 - Screenshots MUST be PNG, or JPEG with `-jpeg`.
-- `zoom` MUST capture the given rectangle at the layout's own resolution, scaled down only to
-  keep its long edge within `-max-edge`, and MUST say that other tools' coordinates are
-  unchanged.
+- `zoom` MUST capture the given rectangle magnified three times over the screenshot, or to
+  the output's own scale when that is finer, and less only to keep its long edge within
+  `-max-edge`. It MUST say that other tools' coordinates are unchanged, and when the image
+  holds more pixels than the output drew, that it is enlarged.
+- A tool that acts (`click`, `move`, `drag`, `mouse_down`, `mouse_up`, `scroll`, `type`, `key`,
+  `focus_window`, `close_window`, `launch`, `click_element`, `set_text`, `set_value`,
+  `scroll_to`, `wait`, `wait_for`, `batch`) MUST accept `screenshot`. When it is true and the
+  tool succeeded, the result MUST end with the screen as `screenshot` returns it, captured
+  once nothing on the output has changed for 200 ms (as screencopy's damage reports it),
+  starting 120 ms after the action, or after 2.5 s whatever it is doing; in the last case the
+  result MUST say the screen was still changing. Without `screenshot` no image is returned.
 - `windows` MUST list every window in sway's tree, tiled and floating, with its container id,
   title, app id (or X11 class), process id, bounds, workspace, and whether it is floating or
   focused. A window on another output than swampcy's MUST say which, and that it is not in
@@ -58,10 +66,33 @@ no session of its own and serves nothing on the network.
 - Pointer, keyboard, focus, launch and element actions MUST be serialised: a tool that moves
   the pointer or presses keys MUST NOT interleave with another, even when the agent calls
   tools in parallel.
+- The same tools MUST be serialised across every swampcy on the seat, by an exclusive `flock`
+  on `$XDG_RUNTIME_DIR/swampcy/input-<seat>.lock` held for the action (for the whole of a
+  `batch`). A lock not had within ten seconds MUST be gone without, with a warning logged.
 - `click` MUST move the pointer to the point and press and release the button `count` times
-  (1 to 3); `button` is `left`, `right` or `middle`.
+  (1 to 3); `button` is `left`, `right` or `middle`. `modifiers` (`ctrl`, `shift`, `alt`,
+  `super`, joined with `+`) MUST be held on swampcy's keyboard from before the first press
+  until after the last release, and released if a step fails. `scroll` takes them likewise.
 - `drag` MUST press at the start, pass through intermediate points to the end, and release,
-  releasing the button if any step fails.
+  releasing the button if any step fails. With `via` it MUST pass through those points in
+  order; with `hold_ms` (at most 5000) it MUST pause that long between pressing and moving.
+- `mouse_down` MUST move to its point and press the button, leaving it held; `mouse_up` MUST
+  release it, moving first when given a point.
+- `key` with `repeat` (1 to 100) MUST press its keys that many times; with `hold_ms` (at most
+  10000) it MUST hold the one combination given down that long, and MUST refuse more than one
+  combination, or a key that is not on the US keymap.
+- `clipboard_get` MUST return the text of the seat's selection, read through
+  `zwlr_data_control_device_v1`, at most 20,000 characters; `clipboard_set` MUST make its text
+  the selection, which lasts as long as that swampcy runs or until something replaces it.
+- `wait` MUST wait `ms` (at most 30000). `wait_for` MUST look every 250 ms for a widget
+  matching `name` and `role` as `find_elements` does, or with `title` for a window whose title
+  or app contains it, until one is there (or with `gone`, until none is), and MUST return a
+  tool error after `timeout_ms` (default 5000, at most 60000).
+- `batch` MUST run its actions (1 to 25, any tool but `batch` and `replay`) in order, checking
+  each one's arguments against that tool's schema, pausing 80 ms after one that acts, and
+  MUST stop at the first that fails, returning what ran, the failure, and how many did not run.
+- `close_window` MUST send the window sway's `kill`, wait up to 1.5 s for it to go, and say so
+  when it is still there.
 - `scroll` MUST move the pointer to the point and send `amount` (1 to 50) wheel clicks.
 - swampcy MUST hold, for as long as the session answers, a Wayland connection with a virtual
   pointer (`zwlr_virtual_pointer_v1`) and a virtual keyboard (`zwp_virtual_keyboard_v1`,
@@ -113,7 +144,9 @@ no session of its own and serves nothing on the network.
   MUST get `--force-renderer-accessibility` after that word unless it already has it; Chrome
   154 otherwise shows AT-SPI only its frame. It SHOULD wait up to
   `wait_ms` (default 5000) for a window that was not there before, and report it, preferring
-  one owned by the process it started. It SHOULD then wait about half a second more, because
+  one owned by the process it started. When the command's shell exits with an error before any
+  new window appears, `launch` MUST return at once with a tool error holding the exit status
+  and what the command wrote. It SHOULD then wait about half a second more, because
   a window appears before its first frame is drawn. A window that opened on another output
   (new windows open where seat0's focus is) MUST be moved to swampcy's output and focused.
 
@@ -142,18 +175,30 @@ no session of its own and serves nothing on the network.
 - Element references MUST be short (`e12`), and MUST be stable: the same element MUST get the
   same reference from every call.
 - `accessibility_tree` MUST outline one window (default the focused one) depth-first, leave
-  out elements that are not showing unless `all` is set. It MUST leave out, while keeping
+  out elements that are not showing unless `all` is set. Inside a web document, a container
+  that is not showing MUST still be looked into: a scrolled page's wrappers are off the screen
+  while its text is on it. It MUST leave out, while keeping
   their children, unnamed generic containers (GTK 4's `generic` and `group` among them)
-  without actions of their own, and labels that repeat their parent's name. It MUST NOT list
-  the actions toolkits give every label and text widget (`clipboard.`, `selection.`, `menu.`,
-  `link.`, `text.`), and MUST list at most six actions a line. Each line MUST carry the
+  without actions of their own, and text that repeats the name of the element shown above it.
+  It MUST NOT list the actions toolkits give every element (`clipboard.`, `selection.`,
+  `menu.`, `link.`, `text.`, and Chrome's `showContextMenu`, `clickAncestor` and `doDefault`),
+  and MUST list at most six actions a line. An action whose name `GetActions` leaves empty,
+  as Chrome's are, MUST be named by `GetName`. The application's other top-level children
+  that are popups and showing (Chrome's bubbles and alerts, which are not windows in sway's
+  tree) MUST be outlined before the window, marked as popups, and searched by `find_elements`. Each line MUST carry the
   reference, role, name, bounds, notable states, and actions. It MUST stop at `max_nodes`
   (default 400) and say so.
 - `find_elements` MUST match case-insensitive substrings of name and role, in one window or
-  all of them, and MUST refuse a query with neither.
+  all of them, and MUST refuse a query with neither. With `all` it MUST also match elements
+  that are not showing, and say so of each.
+- `scroll_to` MUST ask the element's app to scroll it to the top of its view
+  (`Component.ScrollTo`), or anywhere in view when that is refused, and report where it then is.
+- `set_value` MUST set `Value.CurrentValue` and report the value the element then has. The
+  outline MUST show `value=current (min..max)` for an element with a value.
 - `click_element` MUST perform the named action, or the first of click, press, activate,
-  toggle, jump, open, select, switch that the element offers. With `pointer`, or when the
-  element has no action, it MUST click the centre of the element's current bounds instead.
+  doDefault, toggle, jump, open, select, switch that the element offers. An element with
+  none of them whose parent has the Selection interface MUST be selected through it. With
+  `pointer`, or failing those, it MUST click the centre of the element's current bounds.
 - After performing a `click` action in an application whose `ToolkitName` is GTK,
   `click_element` MUST wait 300 ms before it returns, holding the input lock, so that the
   click has landed and the next action cannot fall inside GTK's activation.
@@ -163,7 +208,8 @@ no session of its own and serves nothing on the network.
 ### Replays
 
 - With `-replay` (the default), after `click`, `click_element`, `key`, `type`, `scroll`,
-  `drag`, `launch` or `set_text` succeeds, swampcy MUST queue a capture of its output, scaled
+  `drag`, `launch`, `set_text`, `mouse_down`, `mouse_up`, `set_value`, `scroll_to` or
+  `close_window` succeeds, swampcy MUST queue a capture of its output, scaled
   so that it is `-replay-width` (default 640) pixels wide and never scaled up, taken about
   300 ms after the tool returns. The tool MUST NOT wait for that capture, and a capture
   that cannot be queued MUST be dropped. No other tool MAY capture a frame.
