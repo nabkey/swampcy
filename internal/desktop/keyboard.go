@@ -1,12 +1,14 @@
 package desktop
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"regexp"
 	"slices"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -172,6 +174,300 @@ func (v *VirtualInput) Keys(combos []Combo, delay time.Duration) error {
 		}
 	}
 	return nil
+}
+
+// Stroke is one key of paced typing: a character, or a key or shortcut, pressed
+// a while after the one before and held for a while, as a finger does.
+type Stroke struct {
+	Char   rune          // the character to type; 0 when Key is the stroke
+	Key    Combo         // a key or shortcut, when Char is 0
+	Before time.Duration // from the stroke before going down to this one going down
+	Hold   time.Duration // how long it stays down
+	// Lead is how long its modifiers (Shift, for a capital) are down before it, and
+	// Lag how long they stay after it is up; 0 for a short default.
+	Lead, Lag time.Duration
+}
+
+// Strokes types strokes at their own pace. A plain letter may go down before the
+// one before it is up, as fast fingers overlap; anything with a modifier waits
+// for every key to be up. Shift goes down a moment before the key that needs it
+// and comes up a moment after, and stays down across capitals typed in a row. A
+// cancelled ctx stops it, with nothing left held.
+func (v *VirtualInput) Strokes(ctx context.Context, strokes []Stroke) error {
+	for _, s := range strokes {
+		if s.Char != 0 {
+			if _, err := runeKeysym(s.Char); err != nil {
+				return err
+			}
+			continue
+		}
+		if !keysymName.MatchString(s.Key.Key) {
+			return fmt.Errorf("%q is not a keysym name", s.Key.Key)
+		}
+		for _, m := range s.Key.Mods {
+			if _, ok := modCodes[m]; !ok {
+				return fmt.Errorf("unknown modifier %q", m)
+			}
+		}
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	plain := v.mods == 0 // a held modifier would change what the keys mean
+	const shift = 42
+	shifted := func(s Stroke) bool {
+		k, ok := usKeys[s.Char]
+		return s.Char != 0 && plain && ok && k.shift
+	}
+	lead := func(s Stroke) time.Duration {
+		if s.Lead > 0 {
+			return s.Lead
+		}
+		return min(max(s.Hold/2, 15*time.Millisecond), 45*time.Millisecond)
+	}
+	lag := func(s Stroke) time.Duration {
+		if s.Lag > 0 {
+			return s.Lag
+		}
+		return lead(s) / 2
+	}
+	// down are the letters pressed and not yet due up, in the order they are due.
+	type held struct {
+		code  uint32
+		until time.Time
+	}
+	var down []held
+	carried := false // Shift left down by the stroke before
+	defer func() {
+		for _, h := range down {
+			_ = v.key(h.code, false)
+		}
+		if carried {
+			_ = v.key(shift, false)
+		}
+	}()
+	// wait sleeps until t, letting go of each held letter as it falls due.
+	wait := func(t time.Time) error {
+		for {
+			next := t
+			if len(down) > 0 && down[0].until.Before(t) {
+				next = down[0].until
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Until(next)):
+			}
+			if len(down) == 0 || down[0].until.After(next) {
+				return nil
+			}
+			h := down[0]
+			down = down[1:]
+			if err := v.key(h.code, false); err != nil {
+				return err
+			}
+		}
+	}
+	// flush waits for every held letter to come up, and says when the last did.
+	flush := func() (time.Time, error) {
+		if len(down) == 0 {
+			return time.Time{}, nil
+		}
+		err := wait(down[len(down)-1].until)
+		return time.Now(), err
+	}
+	const gap = 20 * time.Millisecond // the least time between one key up and the next down
+	lastDown, lastUp := time.Now(), time.Time{}
+	for i, s := range strokes {
+		at := lastDown.Add(s.Before)
+		k, us := usKeys[s.Char]
+		if s.Char != 0 && us && plain && !k.shift {
+			// A letter: it may overlap the ones before, but not itself.
+			for _, h := range down {
+				if h.code == k.code && at.Before(h.until.Add(gap)) {
+					at = h.until.Add(gap)
+				}
+			}
+			if at.Before(lastUp.Add(gap)) {
+				at = lastUp.Add(gap)
+			}
+			if err := wait(at); err != nil {
+				return err
+			}
+			if err := v.key(k.code, true); err != nil {
+				return err
+			}
+			lastDown = time.Now()
+			h := held{k.code, lastDown.Add(s.Hold)}
+			j := len(down)
+			for j > 0 && down[j-1].until.After(h.until) {
+				j--
+			}
+			down = slices.Insert(down, j, h)
+			continue
+		}
+		// Anything else is pressed with every other key up.
+		if up, err := flush(); err != nil {
+			return err
+		} else if up.After(lastUp) {
+			lastUp = up
+		}
+		if at.Before(lastUp.Add(gap)) {
+			at = lastUp.Add(gap)
+		}
+		if err := wait(at); err != nil {
+			return err
+		}
+		if s.Char != 0 {
+			if !us || !plain {
+				sym, _ := runeKeysym(s.Char)
+				lastDown = time.Now()
+				if err := v.typeSolo(sym, soloCode(s.Char), 0, s.Hold); err != nil {
+					return err
+				}
+				lastUp = time.Now()
+				continue
+			}
+			if !carried {
+				if err := v.key(shift, true); err != nil {
+					return err
+				}
+				carried = true
+				time.Sleep(lead(s))
+			}
+			lastDown = time.Now()
+			if err := v.tap(k.code, s.Hold); err != nil {
+				return err
+			}
+			if !(i+1 < len(strokes) && shifted(strokes[i+1]) && strokes[i+1].Before < 400*time.Millisecond) {
+				time.Sleep(lag(s))
+				carried = false
+				if err := v.key(shift, false); err != nil {
+					return err
+				}
+			}
+			lastUp = time.Now()
+			continue
+		}
+		uk, ok := usKeysyms[s.Key.Key]
+		if !ok {
+			var mask uint32
+			for _, m := range s.Key.Mods {
+				mask |= modCodes[m].mask
+			}
+			lastDown = time.Now()
+			if err := v.typeSolo(s.Key.Key, keySpare, mask, s.Hold); err != nil {
+				return err
+			}
+			lastUp = time.Now()
+			continue
+		}
+		var mods []uint32
+		for _, m := range s.Key.Mods {
+			mods = append(mods, modCodes[m].code)
+		}
+		if uk.shift && !slices.Contains(mods, shift) {
+			mods = append(mods, shift)
+		}
+		err := func() (err error) {
+			var pressed []uint32
+			defer func() {
+				if len(pressed) > 0 {
+					time.Sleep(lag(s))
+				}
+				for j := len(pressed) - 1; j >= 0; j-- {
+					if e := v.key(pressed[j], false); err == nil {
+						err = e
+					}
+				}
+			}()
+			for _, m := range mods {
+				if err := v.key(m, true); err != nil {
+					return err
+				}
+				pressed = append(pressed, m)
+				time.Sleep(lead(s))
+			}
+			lastDown = time.Now()
+			return v.tap(uk.code, s.Hold)
+		}()
+		if err != nil {
+			return err
+		}
+		lastUp = time.Now()
+	}
+	_, err := flush()
+	return err
+}
+
+// keySpare is the key a character with no key of its own is typed on: evdev's
+// KEY_102ND, the extra key beside left Shift on keyboards outside the US, which
+// types a character there and is no app's shortcut. Not the first keycode, as
+// bulk typing uses: that is Escape, and a page that watches for the Escape key
+// would see it go down with the character. Not KEY_UNKNOWN either: Chrome
+// drops a character typed on that.
+const keySpare = 86
+
+// baseLetters are the accented Latin letters by the unaccented one they are
+// typed with on keyboards that have them.
+var baseLetters = func() map[rune]rune {
+	m := map[rune]rune{}
+	for base, accented := range map[rune]string{
+		'a': "àáâãäåāăą", 'c': "çćĉċč", 'd': "ďđ", 'e': "èéêëēĕėęě", 'g': "ĝğġģ", 'h': "ĥħ",
+		'i': "ìíîïĩīĭįı", 'j': "ĵ", 'k': "ķ", 'l': "ĺļľŀł", 'n': "ñńņň", 'o': "òóôõöøōŏő",
+		'r': "ŕŗř", 's': "śŝşšß", 't': "ţťŧ", 'u': "ùúûüũūŭůűų", 'w': "ŵ", 'y': "ýÿŷ", 'z': "źżž",
+	} {
+		for _, c := range accented {
+			m[c] = base
+			m[unicode.ToUpper(c)] = base
+		}
+	}
+	return m
+}()
+
+// soloCode is the key a character off the US keymap is typed on: its
+// unaccented letter's, as on a keyboard that has it, or else the spare key's.
+func soloCode(c rune) uint32 {
+	if base, ok := baseLetters[c]; ok {
+		return usKeys[base].code
+	}
+	return keySpare
+}
+
+// typeSolo types one keysym, held for hold with the modifier mask mods set, on a
+// keymap that has it alone on the evdev key code, then gives the keyboard the US
+// keymap and the modifiers held back.
+func (v *VirtualInput) typeSolo(sym string, code, mods uint32, hold time.Duration) (err error) {
+	defer func() {
+		if e := v.setKeymap(usKeymap); err == nil {
+			err = e
+		}
+		if e := v.w.send(v.keyboard, vkModifiers, nil, v.mods, uint32(0), v.locked, uint32(0)); err == nil {
+			err = e
+		}
+	}()
+	km := fmt.Sprintf("xkb_keymap {\n\txkb_keycodes \"swampcy\" {\n\t\tminimum = 8;\n\t\tmaximum = 255;\n\t\t<K1> = %d;\n\t};\n"+
+		"\txkb_types \"swampcy\" { include \"complete\" };\n\txkb_compat \"swampcy\" { include \"complete\" };\n"+
+		"\txkb_symbols \"swampcy\" {\n\t\tkey <K1> { [ %s ] };\n\t};\n};\n", code+8, sym)
+	if err := v.setKeymap(km); err != nil {
+		return err
+	}
+	if err := v.w.send(v.keyboard, vkModifiers, nil, mods, uint32(0), uint32(0), uint32(0)); err != nil {
+		return err
+	}
+	if err := v.w.send(v.keyboard, vkKey, nil, v.now(), code, uint32(1)); err != nil {
+		return err
+	}
+	time.Sleep(hold)
+	return v.w.send(v.keyboard, vkKey, nil, v.now(), code, uint32(0))
+}
+
+// tap presses a key, holds it and lets it go.
+func (v *VirtualInput) tap(code uint32, hold time.Duration) error {
+	if err := v.key(code, true); err != nil {
+		return err
+	}
+	time.Sleep(hold)
+	return v.key(code, false)
 }
 
 // HoldMods presses (or releases) modifier keys and leaves them so, for a click or
@@ -403,6 +699,7 @@ var usKeysyms = func() map[string]usKey {
 		"KP_Enter": 96, "Print": 99, "Home": 102, "Up": 103, "Page_Up": 104, "Prior": 104,
 		"Left": 105, "Right": 106, "End": 107, "Down": 108, "Page_Down": 109, "Next": 109,
 		"Insert": 110, "Delete": 111, "Pause": 119, "Menu": 127,
+		"Shift_L": 42, "Shift_R": 54, "Control_L": 29, "Control_R": 97, "Alt_L": 56, "Super_L": 125,
 		"F1": 59, "F2": 60, "F3": 61, "F4": 62, "F5": 63, "F6": 64, "F7": 65, "F8": 66, "F9": 67,
 		"F10": 68, "F11": 87, "F12": 88,
 	} {

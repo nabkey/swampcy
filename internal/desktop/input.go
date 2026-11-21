@@ -21,6 +21,8 @@ type Pointer interface {
 type Keyboard interface {
 	Type(ctx context.Context, text string) error
 	Keys(ctx context.Context, combos []Combo) error
+	// Strokes types strokes, each after its pause and held its while.
+	Strokes(ctx context.Context, strokes []Stroke) error
 	// HoldMods presses or releases modifiers (Combo's names) and leaves them so.
 	HoldMods(ctx context.Context, mods []string, down bool) error
 	// HoldKey holds one combination down for d.

@@ -44,6 +44,11 @@ type Accessibility interface {
 	ScrollTo(ctx context.Context, ref string) error
 	SetValue(ctx context.Context, ref string, v float64) (string, error)
 	Line(ctx context.Context, ref string, tree *Node, g Geometry) (string, error)
+	// Value is a widget's value and its range; WindowOf the window a ref was found
+	// in; URL the address of the web page a window shows, or "".
+	Value(ctx context.Context, ref string) (cur, lo, hi float64, err error)
+	WindowOf(ref string) (int64, error)
+	URL(ctx context.Context, w Window) (string, error)
 }
 
 // Desktop holds what the tools act through.
@@ -71,6 +76,34 @@ type Desktop struct {
 	ClipboardText    func() (string, error)
 	SetClipboardText func(string) error
 
+	// Human plans the input of tools asked to act as a person would; Server makes
+	// one when there is none. AsHuman makes that every tool's default.
+	Human   *Human
+	AsHuman bool
+	// Sites, when set, says site by site whether to act as a person, over AsHuman,
+	// and the agent reads and changes it with site_settings and set_site_settings.
+	Sites *Sites
+
+	// pages is the site each browser window was last seen showing.
+	pagesMu sync.Mutex
+	pages   map[int64]page
+
+	// PointerAt and SetPointerAt, when set, read and keep where the seat's pointer
+	// was last put, in layout coordinates, for every swampcy on the seat: a path
+	// made as a person would starts where the last server left the pointer.
+	PointerAt    func() (x, y int, ok bool)
+	SetPointerAt func(x, y int)
+
+	// pressed counts the buttons mouse_down holds: the pointer moves with care
+	// while there are any, as within a drag.
+	pressed int
+
+	// at is where the pointer was last put, once it has been put anywhere, and
+	// kept the last place SetPointerAt was told.
+	at      [2]int
+	atKnown bool
+	kept    [2]int
+
 	// tools are the handlers by name, for batch.
 	tools map[string]func(context.Context, json.RawMessage) (*mcp.CallToolResult, error)
 
@@ -88,8 +121,27 @@ const instructions = `swampcy drives a headless sway desktop: a screen nobody el
 - After something slow (a page load, a dialog opening), use wait_for rather than repeated screenshots.
 - There may be other screens, such as the owner's: windows says which screen each window is on, and move_window moves one between screens (to hand the owner a window, or take one back).`
 
+const humanInstructions = `
+- Tools can act as a person's hand would (as_human): the pointer travels to each point along a wavering path, sometimes past it and back, and lands a pixel or two off; typing is at a person's pace, with the odd wrong letter backspaced and typed again; click_element, set_text, scroll_to and set_value use the pointer, wheel and keys. Use it on a site that balks at instant, exact input, and on an app under test that should get the events its users send. It takes longer, so batch steps, and paste long text with clipboard_set and ctrl+v. Pass typos:false to type where one wrong key would do harm (an app with single-key shortcuts, a terminal mid-command).`
+
+const sitesInstructions = `
+- Acting as a person is one switch per site, kept for every later session: site_settings shows where it is on, set_site_settings turns it on or off for a site. as_human on a call overrides it for that call.`
+
+const asHumanInstructions = `
+- This server acts as a person would wherever no site setting says otherwise (-as-human).`
+
 // Server builds the MCP server.
 func (d *Desktop) Server(version string) *mcp.Server {
+	if d.Human == nil {
+		d.Human = NewHuman(0)
+	}
+	instructions := instructions + humanInstructions
+	if d.Sites != nil {
+		instructions += sitesInstructions
+	}
+	if d.AsHuman {
+		instructions += asHumanInstructions
+	}
 	s := mcp.NewServer(&mcp.Implementation{Name: "swampcy", Title: "swampcy", Version: version}, &mcp.ServerOptions{Instructions: instructions})
 	ro := &mcp.ToolAnnotations{ReadOnlyHint: true}
 
@@ -168,6 +220,14 @@ func (d *Desktop) Server(version string) *mcp.Server {
 	add(d, s, &mcp.Tool{Name: "set_value",
 		Description: "Set the value of a slider, spin button or scroll bar by ref (one the outline shows a value= for)."},
 		d.setValue)
+	if d.Sites != nil {
+		add(d, s, &mcp.Tool{Name: "site_settings", Annotations: ro,
+			Description: "Show where swampcy acts as a person would: the site the focused window shows (or the site given) and whether it is on there, every site with a setting, and what holds without one."},
+			d.siteSettings)
+		add(d, s, &mcp.Tool{Name: "set_site_settings",
+			Description: `Turn acting as a person on or off for a site, for this and every later session: the pointer's path, where clicks land, the pace and slips of typing, the wheel and sliders all go together. site is a host ("amazon.com" covers its subdomains; "localhost:3000" only that port) or "*" for every site with no setting of its own. remove takes a site's setting away.`},
+			d.setSiteSettings)
+	}
 	if d.ClipboardText != nil {
 		add(d, s, &mcp.Tool{Name: "clipboard_get", Annotations: ro,
 			Description: "Read the clipboard's text: what an app copied with ctrl+c."},
@@ -193,6 +253,219 @@ type After struct {
 }
 
 func (a After) shotAfter() bool { return a.Screenshot }
+
+// Humanly is embedded in the arguments of tools that can act as a person would.
+type Humanly struct {
+	AsHuman *bool `json:"as_human,omitempty" jsonschema:"act as a person's hand would (true) or at once and exactly (false), for this call. Default: the setting of the site the window shows (site_settings), else whether the server runs with -as-human"`
+}
+
+// page is the site a browser window was seen showing, under what title and when.
+type page struct {
+	title, site string
+	seen        time.Time
+}
+
+// pageFresh is how long a window is taken to show the site it did, while its
+// title stays: finding a page's address walks the browser's toolbar each time.
+const pageFresh = 5 * time.Second
+
+// siteOf is the site of the web page w shows ("example.com"), or "" when it
+// shows none or will not say.
+func (d *Desktop) siteOf(ctx context.Context, w *Window) string {
+	if d.A11y == nil || w == nil {
+		return ""
+	}
+	d.pagesMu.Lock()
+	p, ok := d.pages[w.ID]
+	d.pagesMu.Unlock()
+	if ok && p.title == w.Name && time.Since(p.seen) < pageFresh {
+		return p.site
+	}
+	addr, err := d.A11y.URL(ctx, *w)
+	if err != nil {
+		// No accessibility tree (no browser swampcy can read), or a browser too
+		// busy loading to answer. A window that showed a site a moment ago is
+		// taken to show it still, and asked again next time: to forget it here
+		// would be to act on that site as the setting for it says not to.
+		if ok {
+			return p.site
+		}
+		return ""
+	}
+	p = page{title: w.Name, site: siteOfURL(addr), seen: time.Now()}
+	d.pagesMu.Lock()
+	if d.pages == nil || len(d.pages) > 256 {
+		d.pages = map[int64]page{}
+	}
+	d.pages[w.ID] = p
+	d.pagesMu.Unlock()
+	return p.site
+}
+
+// siteRule is what the site settings say for the page w shows (the focused
+// window's when w is nil): whether to act as a person, the entry that says so
+// ("" when none does), and the site.
+func (d *Desktop) siteRule(ctx context.Context, w *Window) (asHuman bool, rule, site string) {
+	if d.Sites == nil {
+		return false, "", ""
+	}
+	sites, _, err := d.Sites.All()
+	if err != nil && d.Log != nil {
+		d.Log.Warn("site settings: going by what was last read", "err", err)
+	}
+	// Only a setting for some site makes the window's site worth finding out.
+	if len(sites) > 1 || (len(sites) == 1 && sites[0] != EverySite) {
+		if w == nil {
+			if tree, err := d.Sway.Tree(); err == nil {
+				w = tree.FocusedWindow()
+			}
+		}
+		site = d.siteOf(ctx, w)
+	}
+	asHuman, rule, _ = d.Sites.For(site)
+	return asHuman, rule, site
+}
+
+// human reports whether a call is to act as a person would: as the call says,
+// else as the settings say for the site w shows (the focused window when nil),
+// else as the server was started.
+func (d *Desktop) human(ctx context.Context, h Humanly, w *Window) bool {
+	if h.AsHuman != nil {
+		return *h.AsHuman
+	}
+	if on, rule, _ := d.siteRule(ctx, w); rule != "" {
+		return on
+	}
+	return d.AsHuman
+}
+
+// windowAt is the window at a point of the layout: the focused one when it is
+// there, else a visible one, a floating one before a tiled.
+func (d *Desktop) windowAt(x, y int) *Window {
+	tree, err := d.Sway.Tree()
+	if err != nil {
+		return nil
+	}
+	var at *Window
+	for _, w := range tree.Windows() {
+		r := w.Rect
+		if x < r.X || x >= r.X+r.Width || y < r.Y || y >= r.Y+r.Height || (w.Visible != nil && !*w.Visible) {
+			continue
+		}
+		if w.Focused {
+			return &w
+		}
+		at = &w
+	}
+	return at
+}
+
+// windowOf is the window an element was found in.
+func (d *Desktop) windowOf(ref string) *Window {
+	id, err := d.A11y.WindowOf(ref)
+	if err != nil {
+		return nil
+	}
+	tree, err := d.Sway.Tree()
+	if err != nil {
+		return nil
+	}
+	return tree.Find(id)
+}
+
+type siteArgs struct {
+	Site string `json:"site,omitempty" jsonschema:"a host to ask about, e.g. amazon.com; default the site the focused window shows"`
+}
+
+func manner(asHuman bool) string {
+	if asHuman {
+		return "as a person"
+	}
+	return "at once and exactly"
+}
+
+func (d *Desktop) siteSettings(ctx context.Context, in siteArgs) (*mcp.CallToolResult, error) {
+	sites, by, err := d.Sites.All()
+	if err != nil {
+		return nil, err
+	}
+	var b strings.Builder
+	site, where := "", ""
+	if in.Site != "" {
+		if site, err = SiteName(in.Site); err != nil {
+			return nil, err
+		}
+		where = "On " + site
+	} else if tree, err := d.Sway.Tree(); err == nil {
+		if w := tree.FocusedWindow(); w != nil {
+			if site = d.siteOf(ctx, w); site != "" {
+				where = "The focused window shows " + site + ": there"
+			} else {
+				where = "The focused window shows no web page swampcy can read the address of: there"
+			}
+		}
+	}
+	if where != "" {
+		on, rule, err := d.Sites.For(site)
+		if err != nil {
+			return nil, err
+		}
+		why := "set for " + rule
+		switch rule {
+		case "":
+			on, why = d.AsHuman, "no setting covers it"
+		case EverySite:
+			why = "the setting for every site"
+		}
+		fmt.Fprintf(&b, "%s swampcy acts %s (%s).\n", where, manner(on), why)
+	}
+	if len(sites) == 0 {
+		b.WriteString("No site has a setting.\n")
+	}
+	for _, s := range sites {
+		name := s
+		if s == EverySite {
+			name = "* (every site with no setting of its own)"
+		}
+		fmt.Fprintf(&b, "  %s: %s\n", name, manner(by[s]))
+	}
+	if _, ok := by[EverySite]; !ok {
+		flag := "the server runs without -as-human"
+		if d.AsHuman {
+			flag = "the server runs with -as-human"
+		}
+		fmt.Fprintf(&b, "Anywhere else: %s (%s).\n", manner(d.AsHuman), flag)
+	}
+	fmt.Fprintf(&b, "Kept in %s. as_human on a call overrides it for that call.", d.Sites.Path)
+	return text("%s", b.String()), nil
+}
+
+type setSiteArgs struct {
+	Site    string `json:"site" jsonschema:"a host such as amazon.com (its subdomains too) or localhost:3000, or * for every site with no setting of its own"`
+	AsHuman *bool  `json:"as_human,omitempty" jsonschema:"true to act as a person there, false to act at once and exactly"`
+	Remove  bool   `json:"remove,omitempty" jsonschema:"take the site's setting away instead"`
+}
+
+func (d *Desktop) setSiteSettings(ctx context.Context, in setSiteArgs) (*mcp.CallToolResult, error) {
+	site, err := SiteName(in.Site)
+	if err != nil {
+		return nil, err
+	}
+	if (in.AsHuman == nil) != in.Remove {
+		return nil, errors.New("give as_human (true or false), or remove, and not both")
+	}
+	if err := d.Sites.Set(site, in.AsHuman); err != nil {
+		return nil, err
+	}
+	name := "on " + site
+	if site == EverySite {
+		name = "on every site with no setting of its own"
+	}
+	if in.Remove {
+		return text("Took away the setting %s.", name), nil
+	}
+	return text("swampcy now acts %s %s, in this and later sessions.", manner(*in.AsHuman), name), nil
+}
 
 // add registers a tool whose handler returns a result, logging each call's
 // duration and error but never its arguments, which may hold typed secrets. The
@@ -310,7 +583,18 @@ func (d *Desktop) lock(ctx context.Context) func() {
 	if d.LockInput != nil {
 		release = d.LockInput()
 	}
+	// Another swampcy may have moved the pointer since this one last did. Read
+	// once, here: from now until the unlock, this server is the one moving it.
+	if d.PointerAt != nil {
+		if x, y, ok := d.PointerAt(); ok {
+			d.at, d.atKnown, d.kept = [2]int{x, y}, true, [2]int{x, y}
+		}
+	}
 	return func() {
+		if d.SetPointerAt != nil && d.atKnown && d.at != d.kept {
+			d.SetPointerAt(d.at[0], d.at[1])
+			d.kept = d.at
+		}
 		if release != nil {
 			release()
 		}
@@ -432,6 +716,7 @@ type clickArgs struct {
 	Count  int    `json:"count,omitempty" jsonschema:"1 (default), 2 for a double-click, 3 for a triple-click"`
 	Mods   string `json:"modifiers,omitempty" jsonschema:"keys held during the click: ctrl, shift, alt, super, or several joined with +"`
 	After
+	Humanly
 }
 
 func (d *Desktop) click(ctx context.Context, in clickArgs) (*mcp.CallToolResult, error) {
@@ -452,7 +737,12 @@ func (d *Desktop) click(ctx context.Context, in clickArgs) (*mcp.CallToolResult,
 	if err != nil {
 		return nil, err
 	}
-	if err := d.clickAt(ctx, g, x, y, button, count, mods); err != nil {
+	human := d.human(ctx, in.Humanly, d.windowAt(x, y))
+	if human {
+		// A hand does not land on the pixel it aims at.
+		x, y = d.Human.Near(x, y, 2)
+	}
+	if err := d.clickAt(ctx, g, x, y, button, count, mods, human, 0); err != nil {
 		return nil, err
 	}
 	with := ""
@@ -462,19 +752,42 @@ func (d *Desktop) click(ctx context.Context, in clickArgs) (*mcp.CallToolResult,
 	return text("Clicked %s ×%d at (%d,%d)%s.", button, count, in.X, in.Y, with), nil
 }
 
-// withMods runs fn with modifier keys held, letting them go whatever happens.
-func (d *Desktop) withMods(ctx context.Context, mods []string, fn func() error) error {
+// withMods runs fn with modifier keys held, letting them go whatever happens. As
+// a person (human), they go down one after another, a moment before what they
+// are held for, and come up a moment after it.
+func (d *Desktop) withMods(ctx context.Context, mods []string, human bool, fn func() error) error {
 	if len(mods) == 0 {
 		return fn()
 	}
-	if err := d.Keyboard.HoldMods(ctx, mods, true); err != nil {
-		_ = d.Keyboard.HoldMods(ctx, mods, false)
+	if !human {
+		if err := d.Keyboard.HoldMods(ctx, mods, true); err != nil {
+			_ = d.Keyboard.HoldMods(ctx, mods, false)
+			return err
+		}
+		time.Sleep(settleAfterMove)
+		err := fn()
+		if e := d.Keyboard.HoldMods(ctx, mods, false); err == nil {
+			err = e
+		}
 		return err
 	}
-	time.Sleep(settleAfterMove)
-	err := fn()
-	if e := d.Keyboard.HoldMods(ctx, mods, false); err == nil {
-		err = e
+	var err error
+	held := 0
+	for ; held < len(mods) && err == nil; held++ {
+		err = d.Keyboard.HoldMods(ctx, mods[held:held+1], true)
+		d.Human.Nap(d.Human.Hold())
+	}
+	if err == nil {
+		err = fn()
+		d.Human.Nap(d.Human.Hold())
+	}
+	for i := held - 1; i >= 0; i-- {
+		if e := d.Keyboard.HoldMods(ctx, mods[i:i+1], false); err == nil {
+			err = e
+		}
+		if i > 0 {
+			d.Human.Nap(d.Human.Hold() / 3)
+		}
 	}
 	return err
 }
@@ -497,27 +810,104 @@ func (d *Desktop) arrive(g Geometry, x, y int) error {
 	if nx < g.Layout.X {
 		nx = x + 1
 	}
-	if err := d.Pointer.MoveTo(nx, y); err != nil {
+	if err := d.moveTo(nx, y); err != nil {
 		return err
 	}
-	return d.Pointer.MoveTo(x, y)
+	return d.moveTo(x, y)
 }
 
-func (d *Desktop) clickAt(ctx context.Context, g Geometry, x, y int, button string, count int, mods []string) error {
-	defer d.lock(ctx)()
-	if err := d.arrive(g, x, y); err != nil {
+// moveTo puts the pointer at (x, y) and remembers that it is there.
+func (d *Desktop) moveTo(x, y int) error {
+	if err := d.Pointer.MoveTo(x, y); err != nil {
 		return err
 	}
-	time.Sleep(settleAfterMove)
-	return d.withMods(ctx, mods, func() error {
+	d.at, d.atKnown = [2]int{x, y}, true
+	return nil
+}
+
+// targetWidth is how wide a hand takes a target to be when nothing says.
+const targetWidth = 24
+
+// where is where the pointer is on this screen, as far as anyone knows: where a
+// swampcy on the seat last put it (lock reads that). What a viewer's own pointer
+// did is not known.
+func (d *Desktop) where(g Geometry) ([2]int, bool) {
+	r := g.Layout
+	if !d.atKnown || d.at[0] < r.X || d.at[0] >= r.X+r.Width || d.at[1] < r.Y || d.at[1] >= r.Y+r.Height {
+		return [2]int{}, false
+	}
+	return d.at, true
+}
+
+// glide takes the pointer to (x, y) as a hand would: from where it is, along the
+// path Human plans, every point of it sent as motion. width is the target's, or 0
+// when it is not known; careful is for a drag. When nobody knows where the
+// pointer is, it is first put somewhere, which the app sees as a jump.
+func (d *Desktop) glide(ctx context.Context, g Geometry, x, y int, width float64, careful bool) error {
+	x, y = min(max(x, g.Layout.X), g.Layout.X+g.Layout.Width-1), min(max(y, g.Layout.Y), g.Layout.Y+g.Layout.Height-1)
+	if _, ok := d.where(g); !ok {
+		sx, sy := d.Human.Start(g.Layout)
+		if err := d.moveTo(sx, sy); err != nil {
+			return err
+		}
+	}
+	if width <= 0 {
+		width = targetWidth
+	}
+	steps := d.Human.Path(d.at, [2]int{x, y}, width, g.Layout, careful)
+	if len(steps) == 0 {
+		// Already there: the window must still see it come, by a pixel and back,
+		// as a hand that settles and not in one instant.
+		nx := x - 1
+		if nx < g.Layout.X {
+			nx = x + 1
+		}
+		if err := d.moveTo(nx, y); err != nil {
+			return err
+		}
+		d.Human.Nap(motionTick + d.Human.Hold()/4)
+		return d.moveTo(x, y)
+	}
+	for _, s := range steps {
+		d.Human.Nap(s.Wait)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := d.moveTo(s.X, s.Y); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// clickAt clicks at a point of the layout. As a person would (human), the pointer
+// glides there, to a target width pixels wide, and the pauses are a hand's.
+func (d *Desktop) clickAt(ctx context.Context, g Geometry, x, y int, button string, count int, mods []string, human bool, width float64) error {
+	defer d.lock(ctx)()
+	nap := func(fixed time.Duration, drawn func() time.Duration) {
+		if human {
+			d.Human.Nap(drawn())
+		} else {
+			time.Sleep(fixed)
+		}
+	}
+	if human {
+		if err := d.glide(ctx, g, x, y, width, false); err != nil {
+			return err
+		}
+	} else if err := d.arrive(g, x, y); err != nil {
+		return err
+	}
+	nap(settleAfterMove, d.Human.Dwell)
+	return d.withMods(ctx, mods, human, func() error {
 		for i := range count {
 			if i > 0 {
-				time.Sleep(betweenClicks)
+				nap(betweenClicks, d.Human.Between)
 			}
 			if err := d.Pointer.Press(button); err != nil {
 				return err
 			}
-			time.Sleep(holdButton)
+			nap(holdButton, d.Human.Hold)
 			if err := d.Pointer.Release(button); err != nil {
 				return err
 			}
@@ -530,6 +920,7 @@ type pointArgs struct {
 	X int `json:"x" jsonschema:"in screenshot pixels"`
 	Y int `json:"y" jsonschema:"in screenshot pixels"`
 	After
+	Humanly
 }
 
 type viaPoint struct {
@@ -547,7 +938,12 @@ func (d *Desktop) move(ctx context.Context, in pointArgs) (*mcp.CallToolResult, 
 		return nil, err
 	}
 	defer d.lock(ctx)()
-	if err := d.Pointer.MoveTo(x, y); err != nil {
+	if d.human(ctx, in.Humanly, d.windowAt(x, y)) {
+		err = d.glide(ctx, g, x, y, 0, d.pressed > 0)
+	} else {
+		err = d.moveTo(x, y)
+	}
+	if err != nil {
 		return nil, err
 	}
 	return text("Pointer at (%d,%d).", in.X, in.Y), nil
@@ -562,6 +958,7 @@ type dragArgs struct {
 	Via    []viaPoint `json:"via,omitempty" jsonschema:"points to pass through between the start and the end, in order"`
 	HoldMS int        `json:"hold_ms,omitempty" jsonschema:"pause after pressing and before moving, at most 5000"`
 	After
+	Humanly
 }
 
 // dragSteps is how many intermediate points a drag passes through; apps that
@@ -589,25 +986,46 @@ func (d *Desktop) drag(ctx context.Context, in dragArgs) (*mcp.CallToolResult, e
 		path = append(path, [2]int{x, y})
 	}
 	button := cmp.Or(in.Button, "left")
+	hold := time.Duration(in.HoldMS) * time.Millisecond
 	defer d.lock(ctx)()
-	if err := d.arrive(g, x1, y1); err != nil {
-		return nil, err
-	}
-	time.Sleep(settleAfterMove)
-	if err := d.Pointer.Press(button); err != nil {
-		return nil, err
-	}
-	time.Sleep(time.Duration(in.HoldMS) * time.Millisecond)
-	for seg := 1; seg < len(path); seg++ {
-		from, to := path[seg-1], path[seg]
-		for i := 1; i <= dragSteps; i++ {
-			x := from[0] + int(math.Round(float64(to[0]-from[0])*float64(i)/dragSteps))
-			y := from[1] + int(math.Round(float64(to[1]-from[1])*float64(i)/dragSteps))
-			if err := d.Pointer.MoveTo(x, y); err != nil {
+	if d.human(ctx, in.Humanly, d.windowAt(x1, y1)) {
+		// The ends stay exact: a drag is often to a pixel (a slider's value, a
+		// splitter). The way between them is the hand's, taken with care.
+		if err := d.glide(ctx, g, x1, y1, 0, false); err != nil {
+			return nil, err
+		}
+		d.Human.Nap(d.Human.Dwell())
+		if err := d.Pointer.Press(button); err != nil {
+			return nil, err
+		}
+		d.Human.Nap(max(hold, d.Human.Hold()))
+		for _, to := range path[1:] {
+			if err := d.glide(ctx, g, to[0], to[1], 0, true); err != nil {
 				_ = d.Pointer.Release(button)
 				return nil, err
 			}
-			time.Sleep(10 * time.Millisecond)
+		}
+		d.Human.Nap(d.Human.Dwell())
+	} else {
+		if err := d.arrive(g, x1, y1); err != nil {
+			return nil, err
+		}
+		time.Sleep(settleAfterMove)
+		if err := d.Pointer.Press(button); err != nil {
+			return nil, err
+		}
+		time.Sleep(hold)
+		for seg := 1; seg < len(path); seg++ {
+			from, to := path[seg-1], path[seg]
+			for i := 1; i <= dragSteps; i++ {
+				x := from[0] + int(math.Round(float64(to[0]-from[0])*float64(i)/dragSteps))
+				y := from[1] + int(math.Round(float64(to[1]-from[1])*float64(i)/dragSteps))
+				if err := d.moveTo(x, y); err != nil {
+					_ = d.Pointer.Release(button)
+					return nil, err
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
 		}
 	}
 	if err := d.Pointer.Release(button); err != nil {
@@ -621,6 +1039,7 @@ type buttonAtArgs struct {
 	Y      *int   `json:"y,omitempty" jsonschema:"in screenshot pixels"`
 	Button string `json:"button,omitempty" jsonschema:"left (default), right or middle"`
 	After
+	Humanly
 }
 
 func (d *Desktop) mouseDown(ctx context.Context, in buttonAtArgs) (*mcp.CallToolResult, error) {
@@ -652,25 +1071,32 @@ func (d *Desktop) button(ctx context.Context, in buttonAtArgs, down bool) (*mcp.
 		}
 		// A press arrives as a click does; a release moves straight there, since the
 		// way to it is part of the drag.
-		move := func() error { return d.Pointer.MoveTo(x, y) }
+		move := func() error { return d.moveTo(x, y) }
 		if down {
 			move = func() error { return d.arrive(g, x, y) }
+		}
+		pause := func() { time.Sleep(settleAfterMove) }
+		if d.human(ctx, in.Humanly, d.windowAt(x, y)) {
+			move = func() error { return d.glide(ctx, g, x, y, 0, !down) }
+			pause = func() { d.Human.Nap(d.Human.Dwell()) }
 		}
 		if err := move(); err != nil {
 			return nil, err
 		}
-		time.Sleep(settleAfterMove)
+		pause()
 		where = fmt.Sprintf(" at (%d,%d)", *in.X, *in.Y)
 	}
 	if down {
 		if err := d.Pointer.Press(button); err != nil {
 			return nil, err
 		}
+		d.pressed++
 		return text("Pressed %s%s; it is held until mouse_up.", button, where), nil
 	}
 	if err := d.Pointer.Release(button); err != nil {
 		return nil, err
 	}
+	d.pressed = max(d.pressed-1, 0)
 	return text("Released %s%s.", button, where), nil
 }
 
@@ -681,6 +1107,7 @@ type scrollArgs struct {
 	Amount    int    `json:"amount,omitempty" jsonschema:"wheel clicks, default 3"`
 	Mods      string `json:"modifiers,omitempty" jsonschema:"keys held while scrolling, e.g. ctrl"`
 	After
+	Humanly
 }
 
 func (d *Desktop) scroll(ctx context.Context, in scrollArgs) (*mcp.CallToolResult, error) {
@@ -701,26 +1128,75 @@ func (d *Desktop) scroll(ctx context.Context, in scrollArgs) (*mcp.CallToolResul
 		return nil, err
 	}
 	defer d.lock(ctx)()
-	if err := d.arrive(g, x, y); err != nil {
+	wheel := func() error { return d.Pointer.Scroll(in.Direction, amount) }
+	human := d.human(ctx, in.Humanly, d.windowAt(x, y))
+	if human {
+		// A hand already about there stays put, and one that moves does not aim to
+		// the pixel; the wheel turns a few clicks at a time.
+		if at, ok := d.where(g); !ok || math.Hypot(float64(at[0]-x), float64(at[1]-y)) > 12 {
+			nx, ny := d.Human.Near(x, y, 6)
+			if err := d.glide(ctx, g, nx, ny, 60, false); err != nil {
+				return nil, err
+			}
+			d.Human.Nap(d.Human.Dwell())
+		}
+		wheel = func() error {
+			for _, wait := range d.Human.Ticks(amount) {
+				d.Human.Nap(wait)
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				if err := d.Pointer.Scroll(in.Direction, 1); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	} else if err := d.arrive(g, x, y); err != nil {
 		return nil, err
 	}
-	if err := d.withMods(ctx, mods, func() error { return d.Pointer.Scroll(in.Direction, amount) }); err != nil {
+	if err := d.withMods(ctx, mods, human, wheel); err != nil {
 		return nil, err
 	}
 	return text("Scrolled %s %d at (%d,%d).", in.Direction, amount, in.X, in.Y), nil
 }
 
 type typeArgs struct {
-	Text string `json:"text" jsonschema:"the text to type"`
+	Text  string `json:"text" jsonschema:"the text to type"`
+	Typos *bool  `json:"typos,omitempty" jsonschema:"when typing as a person would: now and then hit a wrong letter, notice, and backspace it away (default true). The text ends up exact either way; pass false where one wrong key would do harm"`
 	After
+	Humanly
 }
 
 func (d *Desktop) typeText(ctx context.Context, in typeArgs) (*mcp.CallToolResult, error) {
 	defer d.lock(ctx)()
+	if d.human(ctx, in.Humanly, nil) {
+		slips, err := d.typeHuman(ctx, in.Text, in.Typos == nil || *in.Typos)
+		if err != nil {
+			return nil, err
+		}
+		return text("Typed %d characters as a person would%s.", len([]rune(in.Text)), slipText(slips)), nil
+	}
 	if err := d.Keyboard.Type(ctx, in.Text); err != nil {
 		return nil, err
 	}
 	return text("Typed %d characters.", len([]rune(in.Text))), nil
+}
+
+// typeHuman types s at a person's pace, and reports the slips it made and undid.
+func (d *Desktop) typeHuman(ctx context.Context, s string, slips bool) (int, error) {
+	strokes, made := d.Human.Typing(s, slips)
+	return made, d.Keyboard.Strokes(ctx, strokes)
+}
+
+func slipText(n int) string {
+	switch n {
+	case 0:
+		return ""
+	case 1:
+		return ", with 1 slip backspaced and corrected"
+	}
+	return fmt.Sprintf(", with %d slips backspaced and corrected", n)
 }
 
 type keyArgs struct {
@@ -728,6 +1204,7 @@ type keyArgs struct {
 	Repeat int    `json:"repeat,omitempty" jsonschema:"press them this many times, 1 (default) to 100"`
 	HoldMS int    `json:"hold_ms,omitempty" jsonschema:"hold the one key or shortcut given down this long, at most 10000"`
 	After
+	Humanly
 }
 
 func (d *Desktop) key(ctx context.Context, in keyArgs) (*mcp.CallToolResult, error) {
@@ -756,7 +1233,12 @@ func (d *Desktop) key(ctx context.Context, in keyArgs) (*mcp.CallToolResult, err
 	for range repeat {
 		all = append(all, combos...)
 	}
-	if err := d.Keyboard.Keys(ctx, all); err != nil {
+	if d.human(ctx, in.Humanly, nil) {
+		err = d.Keyboard.Strokes(ctx, d.Human.Keys(all))
+	} else {
+		err = d.Keyboard.Keys(ctx, all)
+	}
+	if err != nil {
 		return nil, err
 	}
 	if repeat > 1 {
@@ -904,7 +1386,13 @@ func (d *Desktop) launch(ctx context.Context, in launchArgs) (*mcp.CallToolResul
 	// last-used keyboard is gone, which is the case after any other swampcy
 	// session has exited: a no-op key makes this server's keyboard the seat's.
 	unlock := d.lock(ctx)
-	if err := d.Keyboard.Keys(ctx, activateKeyboard); err != nil && d.Log != nil {
+	var err error
+	if d.human(ctx, Humanly{}, nil) {
+		err = d.Keyboard.Strokes(ctx, d.Human.Keys(activateKeyboard)) // the page in front sees it
+	} else {
+		err = d.Keyboard.Keys(ctx, activateKeyboard)
+	}
+	if err != nil && d.Log != nil {
 		d.Log.Warn("launch: activating the keyboard", "err", err)
 	}
 	unlock()
@@ -1094,13 +1582,17 @@ type elementArgs struct {
 	Action  string `json:"action,omitempty" jsonschema:"the action to perform, from the element's actions"`
 	Pointer bool   `json:"pointer,omitempty" jsonschema:"click the centre of the element with the pointer instead of performing an action"`
 	After
+	Humanly
 }
 
 func (d *Desktop) clickElement(ctx context.Context, in elementArgs) (*mcp.CallToolResult, error) {
 	if d.A11y == nil {
 		return nil, errNoA11y
 	}
-	if !in.Pointer {
+	// An action performed over the accessibility bus moves no pointer, which no
+	// person could do: as a person, the pointer clicks unless an action is named.
+	human := d.human(ctx, in.Humanly, d.windowOf(in.Ref))
+	if !in.Pointer && !(human && in.Action == "") {
 		unlock := d.lock(ctx)
 		action, err := d.A11y.Activate(ctx, in.Ref, in.Action)
 		unlock()
@@ -1110,6 +1602,20 @@ func (d *Desktop) clickElement(ctx context.Context, in elementArgs) (*mcp.CallTo
 		if !errors.Is(err, errNoAction) {
 			return nil, err
 		}
+	}
+	if human {
+		defer d.lock(ctx)()
+		ctx := context.WithValue(ctx, heldKey{}, true) // the lock is held already
+		r, g, err := d.reach(ctx, in.Ref)
+		if err != nil {
+			return nil, err
+		}
+		x, y := d.Human.Within(r)
+		if err := d.clickAt(ctx, g, x, y, "left", 1, nil, true, float64(min(r.Width, r.Height))); err != nil {
+			return nil, err
+		}
+		s := g.ToShot(Rect{X: x, Y: y})
+		return text("Clicked %s with the pointer at (%d,%d).", in.Ref, s.X, s.Y), nil
 	}
 	tree, err := d.Sway.Tree()
 	if err != nil {
@@ -1124,17 +1630,59 @@ func (d *Desktop) clickElement(ctx context.Context, in elementArgs) (*mcp.CallTo
 		return nil, err
 	}
 	x, y := r.X+r.Width/2, r.Y+r.Height/2
-	if err := d.clickAt(ctx, g, x, y, "left", 1, nil); err != nil {
+	if err := d.clickAt(ctx, g, x, y, "left", 1, nil, false, 0); err != nil {
 		return nil, err
 	}
 	s := g.ToShot(Rect{X: x, Y: y})
 	return text("Clicked the centre of %s at (%d,%d).", in.Ref, s.X, s.Y), nil
 }
 
+// reach is where an element a person is about to click is, once it can be
+// clicked: one that is out of its window's view is first scrolled to, as
+// scroll_to does as a person. A pointer cannot click what is not on the screen,
+// where an action over the accessibility bus could. It must be called with the
+// input lock held.
+func (d *Desktop) reach(ctx context.Context, ref string) (Rect, Geometry, error) {
+	g, err := d.geometry()
+	if err != nil {
+		return Rect{}, g, err
+	}
+	for try := 0; ; try++ {
+		tree, err := d.Sway.Tree()
+		if err != nil {
+			return Rect{}, g, err
+		}
+		r, err := d.A11y.Bounds(ctx, ref, tree)
+		if err != nil {
+			return Rect{}, g, err
+		}
+		view := g.Layout
+		if id, err := d.A11y.WindowOf(ref); err == nil {
+			if w := tree.Find(id); w != nil {
+				view = w.Content()
+			}
+		}
+		x, y := r.X+r.Width/2, r.Y+r.Height/2
+		in := func(v Rect) bool { return x >= v.X && x < v.X+v.Width && y >= v.Y && y < v.Y+v.Height }
+		if in(view) && in(g.Layout) {
+			return r, g, nil
+		}
+		if try > 0 {
+			return Rect{}, g, fmt.Errorf("%s is not in view and scrolling did not bring it there; it cannot be clicked with the pointer", ref)
+		}
+		if _, err := d.wheelTo(ctx, ref); err != nil {
+			return Rect{}, g, err
+		}
+		d.Human.Nap(d.Human.Beat())
+	}
+}
+
 type setTextArgs struct {
-	Ref  string `json:"ref" jsonschema:"element ref of an editable widget"`
-	Text string `json:"text" jsonschema:"the widget's new text"`
+	Ref   string `json:"ref" jsonschema:"element ref of an editable widget"`
+	Text  string `json:"text" jsonschema:"the widget's new text"`
+	Typos *bool  `json:"typos,omitempty" jsonschema:"when typing it as a person would: allow the odd wrong letter, backspaced and corrected (default true)"`
 	After
+	Humanly
 }
 
 func (d *Desktop) setText(ctx context.Context, in setTextArgs) (*mcp.CallToolResult, error) {
@@ -1142,6 +1690,43 @@ func (d *Desktop) setText(ctx context.Context, in setTextArgs) (*mcp.CallToolRes
 		return nil, errNoA11y
 	}
 	defer d.lock(ctx)()
+	if d.human(ctx, in.Humanly, d.windowOf(in.Ref)) {
+		// Text that appears in a field with no key pressed is not a person's: click
+		// into it, select what is there, and type over it.
+		if strings.ContainsAny(in.Text, "\n\r\t") {
+			// Typed, a line break is Return and a tab is Tab: they would send the
+			// form or leave the field, where setting the text does neither.
+			return nil, errors.New("as a person, set_text types the text, and its line break or tab would press Return or Tab; put it on the clipboard with clipboard_set and paste with ctrl+v, or pass as_human:false")
+		}
+		ctx := context.WithValue(ctx, heldKey{}, true) // the lock is held already
+		r, g, err := d.reach(ctx, in.Ref)
+		if err != nil {
+			return nil, err
+		}
+		x, y := d.Human.Within(r)
+		if err := d.clickAt(ctx, g, x, y, "left", 1, nil, true, float64(min(r.Width, r.Height))); err != nil {
+			return nil, err
+		}
+		d.Human.Nap(d.Human.Beat())
+		// Nobody selects all of an empty field.
+		had := "selected its text and typed %d characters over it"
+		if old, err := d.A11y.Text(ctx, in.Ref); err == nil && old == "" {
+			had = "and typed %d characters"
+		} else {
+			over := []Combo{{Mods: []string{"ctrl"}, Key: "a"}}
+			if in.Text == "" {
+				over = append(over, Combo{Key: "BackSpace"})
+			}
+			if err := d.Keyboard.Strokes(ctx, d.Human.Keys(over)); err != nil {
+				return nil, err
+			}
+		}
+		slips, err := d.typeHuman(ctx, in.Text, in.Typos == nil || *in.Typos)
+		if err != nil {
+			return nil, err
+		}
+		return text("Clicked %s, "+had+" as a person would%s.", in.Ref, len([]rune(in.Text)), slipText(slips)), nil
+	}
 	if err := d.A11y.SetText(ctx, in.Ref, in.Text); err != nil {
 		return nil, err
 	}
@@ -1155,6 +1740,7 @@ type refArgs struct {
 type refAfterArgs struct {
 	Ref string `json:"ref" jsonschema:"element ref"`
 	After
+	Humanly
 }
 
 func (d *Desktop) scrollTo(ctx context.Context, in refAfterArgs) (*mcp.CallToolResult, error) {
@@ -1162,7 +1748,13 @@ func (d *Desktop) scrollTo(ctx context.Context, in refAfterArgs) (*mcp.CallToolR
 		return nil, errNoA11y
 	}
 	unlock := d.lock(ctx)
-	err := d.A11y.ScrollTo(ctx, in.Ref)
+	var err error
+	note := ""
+	if d.human(ctx, in.Humanly, d.windowOf(in.Ref)) {
+		note, err = d.wheelTo(ctx, in.Ref)
+	} else {
+		err = d.A11y.ScrollTo(ctx, in.Ref)
+	}
 	unlock()
 	if err != nil {
 		return nil, err
@@ -1178,15 +1770,119 @@ func (d *Desktop) scrollTo(ctx context.Context, in refAfterArgs) (*mcp.CallToolR
 	}
 	line, err := d.A11y.Line(ctx, in.Ref, tree, g)
 	if err != nil {
-		return text("Scrolled to %s.", in.Ref), nil
+		return text("Scrolled to %s%s.", in.Ref, note), nil
 	}
-	return text("Scrolled to it: %s", line), nil
+	return text("Scrolled to it%s: %s", note, line), nil
+}
+
+// wheelBursts is the most turns of the wheel wheelTo makes before it gives up.
+const wheelBursts = 60
+
+// wheelTo brings an element into view as a person would: the pointer over its
+// window, the wheel turned a few clicks at a time until the element is in the
+// middle half of the window, each turn sized by how far the last one moved it.
+// When the wheel does not move it (it is in some other scrolling area than the
+// one under the pointer) the app is asked to scroll, and note says so.
+func (d *Desktop) wheelTo(ctx context.Context, ref string) (note string, err error) {
+	g, err := d.geometry()
+	if err != nil {
+		return "", err
+	}
+	id, err := d.A11y.WindowOf(ref)
+	if err != nil {
+		return "", err
+	}
+	tree, err := d.Sway.Tree()
+	if err != nil {
+		return "", err
+	}
+	w := tree.Find(id)
+	if w == nil {
+		return "", fmt.Errorf("%s's window %d is gone", ref, id)
+	}
+	view := w.Content()
+	inView := func(x, y int) bool {
+		return x >= view.X && x < view.X+view.Width && y >= view.Y && y < view.Y+view.Height
+	}
+	centre := func() (int, int, error) {
+		r, err := d.A11y.Bounds(ctx, ref, tree)
+		return r.X + r.Width/2, r.Y + r.Height/2, err
+	}
+	perClick, stalled := 100.0, 0
+	for range wheelBursts {
+		x, y, err := centre()
+		if err != nil {
+			return "", err
+		}
+		dir, off := "", 0
+		switch midX, midY := view.X+view.Width/2, view.Y+view.Height/2; {
+		case y < view.Y+view.Height/4:
+			dir, off = "up", midY-y
+		case y > view.Y+view.Height*3/4:
+			dir, off = "down", y-midY
+		case x < view.X:
+			dir, off = "left", midX-x
+		case x >= view.X+view.Width:
+			dir, off = "right", x-midX
+		default:
+			return "", nil
+		}
+		if stalled >= 2 {
+			if inView(x, y) {
+				return "", nil // as far as the page goes, and it shows
+			}
+			break
+		}
+		if at, ok := d.where(g); !ok || !inView(at[0], at[1]) {
+			px, py := d.Human.Within(view)
+			if err := d.glide(ctx, g, px, py, float64(min(view.Width, view.Height))/2, false); err != nil {
+				return "", err
+			}
+			d.Human.Nap(d.Human.Dwell())
+		}
+		clicks := min(max(int(math.Round(float64(off)/perClick)), 1), 6)
+		for _, wait := range d.Human.Ticks(clicks) {
+			d.Human.Nap(wait)
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
+			if err := d.Pointer.Scroll(dir, 1); err != nil {
+				return "", err
+			}
+		}
+		// A page glides on after the wheel stops: wait until the element is still.
+		nx, ny := x, y
+		for range 12 {
+			d.Human.Nap(90 * time.Millisecond)
+			px, py := nx, ny
+			if nx, ny, err = centre(); err != nil {
+				return "", err
+			}
+			if nx == px && ny == py && (nx != x || ny != y) {
+				break
+			}
+		}
+		moved := math.Abs(float64(ny - y))
+		if dir == "left" || dir == "right" {
+			moved = math.Abs(float64(nx - x))
+		}
+		if moved < 1 {
+			stalled++
+			continue
+		}
+		stalled, perClick = 0, max(moved/float64(clicks), 10)
+	}
+	if err := d.A11y.ScrollTo(ctx, ref); err != nil {
+		return "", err
+	}
+	return " (the wheel did not bring it into view, so the app was asked to scroll: not as a person would)", nil
 }
 
 type valueArgs struct {
 	Ref   string  `json:"ref" jsonschema:"element ref of a widget with a value"`
 	Value float64 `json:"value" jsonschema:"the new value, within the range the outline shows"`
 	After
+	Humanly
 }
 
 func (d *Desktop) setValue(ctx context.Context, in valueArgs) (*mcp.CallToolResult, error) {
@@ -1194,11 +1890,134 @@ func (d *Desktop) setValue(ctx context.Context, in valueArgs) (*mcp.CallToolResu
 		return nil, errNoA11y
 	}
 	defer d.lock(ctx)()
+	if d.human(ctx, in.Humanly, d.windowOf(in.Ref)) {
+		now, note, err := d.slideTo(ctx, in.Ref, in.Value)
+		if err != nil {
+			return nil, err
+		}
+		return text("%s is now %s%s.", in.Ref, now, note), nil
+	}
 	now, err := d.A11y.SetValue(ctx, in.Ref, in.Value)
 	if err != nil {
 		return nil, err
 	}
 	return text("%s is now %s.", in.Ref, cmp.Or(now, "set")), nil
+}
+
+// slidePresses is the most arrow keys slideTo presses to finish a value.
+const slidePresses = 40
+
+// slideTo sets a widget's value as a person would: a click on its track where
+// the value lies along it, then arrow keys for what is left. It must be called
+// with the input lock held. A widget whose keys do not get there (a spin button
+// a long way off) has the rest set by the app, and note says so.
+func (d *Desktop) slideTo(ctx context.Context, ref string, v float64) (now, note string, err error) {
+	ctx = context.WithValue(ctx, heldKey{}, true) // the lock is held already
+	cur, lo, hi, err := d.A11y.Value(ctx, ref)
+	if err != nil {
+		return "", "", err
+	}
+	if hi <= lo || v < lo || v > hi {
+		return "", "", fmt.Errorf("%s takes values from %s to %s", ref, num(lo), num(hi))
+	}
+	shown := func(cur float64) string { return fmt.Sprintf("%s (%s..%s)", num(cur), num(lo), num(hi)) }
+	there := func(cur float64) bool { return math.Abs(cur-v) <= (hi-lo)*1e-6 }
+	if there(cur) {
+		return shown(cur), "", nil
+	}
+	r, g, err := d.reach(ctx, ref)
+	if err != nil {
+		return "", "", err
+	}
+	// The click also gives it the keyboard, for the arrow keys.
+	x, y := d.Human.Within(r)
+	before, track := cur, true
+	if frac := (v - lo) / (hi - lo); r.Width >= 40 && r.Width >= r.Height {
+		x = r.X + int(math.Round(frac*float64(r.Width-1)))
+	} else if r.Height >= 40 {
+		y = r.Y + int(math.Round((1-frac)*float64(r.Height-1))) // up is more
+	} else {
+		track = false
+	}
+	if track {
+		// Near the point, not on it: the keys make up the difference.
+		jx, jy := d.Human.Near(x, y, 2)
+		x, y = min(max(jx, r.X), r.X+r.Width-1), min(max(jy, r.Y), r.Y+r.Height-1)
+	}
+	if err := d.clickAt(ctx, g, x, y, "left", 1, nil, true, float64(min(r.Width, r.Height))); err != nil {
+		return "", "", err
+	}
+	// An app tells the accessibility bus its new value a moment after it has it:
+	// a value read at once is the old one.
+	changed := func(was float64, most time.Duration) (float64, error) {
+		for range most / (50 * time.Millisecond) {
+			d.Human.Nap(50 * time.Millisecond)
+			now, _, _, err := d.A11y.Value(ctx, ref)
+			if err != nil || now != was {
+				return now, err
+			}
+		}
+		return was, nil
+	}
+	if cur, err = changed(cur, 400*time.Millisecond); err != nil {
+		return "", "", err
+	}
+	d.Human.Nap(d.Human.Beat())
+	more, less := "Right", "Left"
+	if track && cur == before {
+		// A click on the track that changed nothing may have changed it unsaid:
+		// Chrome tells the bus of a slider's click only with its next key. One key,
+		// away from the nearer end so that it counts, brings the real value out.
+		key := more
+		if v > (lo+hi)/2 {
+			key = less
+		}
+		if err := d.Keyboard.Strokes(ctx, d.Human.Keys([]Combo{{Key: key}})); err != nil {
+			return "", "", err
+		}
+		if cur, err = changed(cur, 400*time.Millisecond); err != nil {
+			return "", "", err
+		}
+	}
+	step, vertical, flipped := 0.0, false, false
+keys:
+	for n := 0; n < slidePresses; n++ {
+		// There, as near as its steps come, or too far for keys.
+		if there(cur) || (step > 0 && math.Abs(cur-v) <= step/2) || (step > 0 && math.Abs(cur-v)/step > float64(slidePresses-n)) {
+			break
+		}
+		key := more
+		if cur > v {
+			key = less
+		}
+		if err := d.Keyboard.Strokes(ctx, d.Human.Keys([]Combo{{Key: key}})); err != nil {
+			return "", "", err
+		}
+		next, err := changed(cur, 400*time.Millisecond)
+		switch {
+		case err != nil:
+			return "", "", err
+		case next == cur && !vertical:
+			more, less, vertical = "Up", "Down", true // a spin button's keys
+		case next == cur:
+			break keys
+		case (next > cur) != (key == more) && !flipped:
+			more, less, flipped = less, more, true // it counts the other way
+		case (next > cur) != (key == more):
+			break keys
+		default:
+			step = math.Abs(next - cur)
+		}
+		cur = next
+	}
+	if there(cur) || (step > 0 && math.Abs(cur-v) <= step/2) {
+		return shown(cur), "", nil
+	}
+	set, err := d.A11y.SetValue(ctx, ref, v)
+	if err != nil {
+		return "", "", err
+	}
+	return cmp.Or(set, "set"), " (the pointer and keys did not get it there, so the app was asked to set it: not as a person would)", nil
 }
 
 func (d *Desktop) clipboardGet(ctx context.Context, _ noArgs) (*mcp.CallToolResult, error) {
@@ -1354,8 +2173,17 @@ func (d *Desktop) batch(ctx context.Context, in batchArgs) (*mcp.CallToolResult,
 			res.Content = append(res.Content, c)
 		}
 		// Apps act on input a moment after they get it; the next step waits that out.
+		// As a person, the next step waits as long as a person takes to start it.
 		if i < len(in.Actions)-1 && actingTools[st.Tool] {
-			sleep(ctx, betweenSteps)
+			var as Humanly
+			if v, ok := st.Args["as_human"].(bool); ok {
+				as.AsHuman = &v
+			}
+			if d.human(ctx, as, nil) {
+				d.Human.Nap(d.Human.Beat())
+			} else {
+				sleep(ctx, betweenSteps)
+			}
 		}
 	}
 	return res, nil

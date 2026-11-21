@@ -52,11 +52,33 @@ switched on.
 | `accessibility_tree`, `find_elements` | widgets, each with a ref like `e12`; popups and off-screen ones too |
 | `click_element`, `set_text`, `get_text`, `set_value`, `scroll_to` | act on a widget by ref |
 | `wait`, `wait_for` | until a widget or a window is there, or gone |
+| `site_settings`, `set_site_settings` | where swampcy acts as a person would, site by site |
 | `batch` | several of the above in one call |
 | `replay` | an animated clip of what the agent did, saved under `-replay-dir` |
 
 Every tool that acts takes `screenshot: true`, which waits for the screen to stop changing and
 returns it with the result, so seeing what a click did is not a second call.
+
+swampcy can move, click and type as a person's hand would: the pointer travels a bowed,
+wavering path, sometimes runs past its target and comes back, and lands a pixel or two off;
+buttons and keys are held for a moment; typing is at a person's uneven pace, with the odd
+wrong letter noticed and backspaced. `click_element`, `set_text`, `scroll_to` and `set_value`
+then use the pointer, wheel and keys too, where otherwise they ask the app over the
+accessibility bus. It is for sites that balk at input no hand could make, and for testing
+your own UI with the events real users send (hover, motion, each key in turn). Typing takes
+about a fifth of a second a character.
+
+It is one switch, and it is kept per site in `~/.config/swampcy/sites.json` (`-sites`), which
+the agent reads with `site_settings` and changes with `set_site_settings`:
+
+```json
+{ "as_human": { "amazon.com": true, "localhost:3000": false } }
+```
+
+A site covers its subdomains, the most specific one wins, and `"*"` is every site with no
+setting of its own. Where no setting says, `-as-human` decides (off by default), and
+`as_human` on a call overrides both for that call. swampcy knows a window's site from the
+address its browser gives the accessibility bus. [How it works](docs/design.md#acting-as-a-person).
 
 Coordinates are always pixels of swampcy's screenshots, which are scaled to at most 1568 on the
 long edge (`-max-edge`); swampcy converts them to the screen's.

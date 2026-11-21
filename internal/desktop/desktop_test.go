@@ -49,6 +49,19 @@ func (f *fakeDesk) Keys(_ context.Context, cs []Combo) error {
 	return nil
 }
 
+func (f *fakeDesk) Strokes(_ context.Context, ss []Stroke) error {
+	var b strings.Builder
+	for _, s := range ss {
+		if s.Char != 0 {
+			b.WriteRune(s.Char)
+		} else {
+			fmt.Fprintf(&b, "<%s>", strings.Join(append(slices.Clone(s.Key.Mods), s.Key.Key), "+"))
+		}
+	}
+	f.log("strokes %s", b.String())
+	return nil
+}
+
 func (f *fakeDesk) HoldMods(_ context.Context, mods []string, down bool) error {
 	f.log("mods %v %v", mods, down)
 	return nil
@@ -68,6 +81,11 @@ func (f *fakeDesk) Capture(_ context.Context, r *Rect, scale float64) ([]byte, s
 type fakeA11y struct {
 	activateErr error
 	bounds      Rect
+	boundsFn    func() Rect    // when set, where the element is now
+	valueFn     func() float64 // when set, the element's value, of 0 to 100
+	url         string         // the address of the page every window shows
+	scrolledTo  int            // ScrollTo calls
+	valuesSet   []float64      // SetValue calls
 	finds       int
 	findAfter   int // Find matches nothing until its findAfter'th call
 }
@@ -83,10 +101,19 @@ func (f *fakeA11y) Find(_ context.Context, ws []Window, _ Geometry, q Query, o T
 	}
 	return fmt.Sprintf("find %q %q in %d windows, limit %d all %v", q.Name, q.Role, len(ws), q.Limit, o.All), n, nil
 }
-func (f *fakeA11y) ScrollTo(context.Context, string) error { return nil }
+func (f *fakeA11y) ScrollTo(context.Context, string) error { f.scrolledTo++; return nil }
 func (f *fakeA11y) SetValue(_ context.Context, _ string, v float64) (string, error) {
+	f.valuesSet = append(f.valuesSet, v)
 	return fmt.Sprintf("%g (0..100)", v), nil
 }
+func (f *fakeA11y) Value(context.Context, string) (float64, float64, float64, error) {
+	if f.valueFn != nil {
+		return f.valueFn(), 0, 100, nil
+	}
+	return 10, 0, 100, nil
+}
+func (f *fakeA11y) WindowOf(string) (int64, error)              { return 7, nil }
+func (f *fakeA11y) URL(context.Context, Window) (string, error) { return f.url, nil }
 func (f *fakeA11y) Line(_ context.Context, ref string, _ *Node, _ Geometry) (string, error) {
 	return ref + " button \"OK\" (10,10 20x20)", nil
 }
@@ -96,9 +123,14 @@ func (f *fakeA11y) Activate(_ context.Context, ref, action string) (string, erro
 	}
 	return "click", nil
 }
-func (f *fakeA11y) Bounds(context.Context, string, *Node) (Rect, error) { return f.bounds, nil }
-func (f *fakeA11y) SetText(context.Context, string, string) error       { return nil }
-func (f *fakeA11y) Text(context.Context, string) (string, error)        { return "hello", nil }
+func (f *fakeA11y) Bounds(context.Context, string, *Node) (Rect, error) {
+	if f.boundsFn != nil {
+		return f.boundsFn(), nil
+	}
+	return f.bounds, nil
+}
+func (f *fakeA11y) SetText(context.Context, string, string) error { return nil }
+func (f *fakeA11y) Text(context.Context, string) (string, error)  { return "hello", nil }
 
 func connect(t *testing.T, d *Desktop) *mcp.ClientSession {
 	t.Helper()

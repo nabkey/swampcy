@@ -25,6 +25,7 @@ const (
 	ifEditableText = "org.a11y.atspi.EditableText"
 	ifValue        = "org.a11y.atspi.Value"
 	ifSelection    = "org.a11y.atspi.Selection"
+	ifDocument     = "org.a11y.atspi.Document"
 
 	scrollTopEdge  uint32 = 2 // ATSPI_SCROLL_TOP_EDGE
 	scrollAnywhere uint32 = 6 // ATSPI_SCROLL_ANYWHERE
@@ -891,6 +892,75 @@ func (a *A11y) SetValue(ctx context.Context, ref string, v float64) (string, err
 		return "", err
 	}
 	return n.value, nil
+}
+
+// Value is the value of a slider, spin button or scroll bar, and its range.
+func (a *A11y) Value(ctx context.Context, ref string) (cur, lo, hi float64, err error) {
+	t, err := a.lookup(ref)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	conn, err := a.bus(ctx)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	if err := a.prop(ctx, conn, t.Elem, ifValue, "CurrentValue", &cur); err != nil {
+		return 0, 0, 0, fmt.Errorf("%s: %w (does it have a value?)", ref, err)
+	}
+	_ = a.prop(ctx, conn, t.Elem, ifValue, "MinimumValue", &lo)
+	_ = a.prop(ctx, conn, t.Elem, ifValue, "MaximumValue", &hi)
+	return cur, lo, hi, nil
+}
+
+// WindowOf is the sway window an element was found in.
+func (a *A11y) WindowOf(ref string) (int64, error) {
+	t, err := a.lookup(ref)
+	return t.ConID, err
+}
+
+// urlSearch bounds the search for a window's web page: a browser's page is a few
+// levels under its frame, beside a toolbar's worth of buttons.
+const urlSearch = 2500
+
+// URL is the address of the web page showing in a window, or "" when it shows
+// none: the document a browser's frame holds says where it is from. Chrome calls
+// that attribute URI and Firefox DocURL.
+func (a *A11y) URL(ctx context.Context, w Window) (string, error) {
+	conn, err := a.bus(ctx)
+	if err != nil {
+		return "", err
+	}
+	f, _, err := a.frame(ctx, conn, w)
+	if err != nil {
+		return "", err
+	}
+	queue := []accRef{f}
+	for seen := 0; len(queue) > 0 && seen < urlSearch; seen++ {
+		r := queue[0]
+		queue = queue[1:]
+		var role string
+		if a.call(ctx, conn, r, ifAccessible+".GetRoleName", &role) != nil {
+			continue
+		}
+		if strings.HasPrefix(role, "document") {
+			var st []uint32
+			if a.call(ctx, conn, r, ifAccessible+".GetState", &st) == nil && !stateSet(st).has(stateShowing) {
+				continue // another tab's
+			}
+			for _, name := range []string{"URI", "DocURL"} {
+				var v string
+				if a.call(ctx, conn, r, ifDocument+".GetAttributeValue", &v, name) == nil && v != "" {
+					return v, nil
+				}
+			}
+			continue // a document with no address: not into it, a page is long
+		}
+		var kids []accRef
+		if a.call(ctx, conn, r, ifAccessible+".GetChildren", &kids) == nil {
+			queue = append(queue, kids[:min(len(kids), maxChildren)]...)
+		}
+	}
+	return "", nil
 }
 
 // Line describes one element as the outline would, with where it is now.

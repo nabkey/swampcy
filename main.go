@@ -10,6 +10,8 @@
 //	swampcy -max-edge 1280 -jpeg     # smaller screenshots
 //	swampcy -output HEADLESS-1 -seat seat0
 //	swampcy -replay-dir ~/clips -replay-keep 72h   # where the replay tool's clips go
+//	swampcy -as-human                # move, click and type as a person's hand would,
+//	                                 # wherever ~/.config/swampcy/sites.json does not say
 //
 // `swampcy web` serves the same desktop to a browser on the tailnet instead:
 // behind `tailscale serve`, letting in one Tailscale login, with the screen as
@@ -51,6 +53,8 @@ func main() {
 	appLog := flag.String("app-log", "", "file for launched apps' output (default $XDG_RUNTIME_DIR/swampcy/apps.log)")
 	output := flag.String("output", "", "the output to see and point at (default the one at the layout's top left)")
 	seat := flag.String("seat", "seat0", "the seat the virtual pointer and keyboard join")
+	sites := flag.String("sites", defaultSitesFile(), "file of per-site settings (whether to act as a person there), which the agent reads and changes with site_settings and set_site_settings; empty for none")
+	asHuman := flag.Bool("as-human", false, "act as a person's hand would unless a call says as_human:false: a wavering pointer path, held buttons and keys, typing at a person's pace with corrected slips")
 	replay := flag.Bool("replay", true, "keep a small frame after each action, for the replay tool's clips")
 	replayDir := flag.String("replay-dir", defaultReplayDir(), "directory for replay clips; made 0700, clips 0600")
 	replayWidth := flag.Int("replay-width", 640, "replay frames' width in pixels")
@@ -78,9 +82,13 @@ func main() {
 		log.Warn("no virtual pointer and keyboard yet", "err", err)
 	}
 	d := &desktop.Desktop{Sway: live, Screen: live, Pointer: live, Keyboard: live, Launch: live.Launch, MaxEdge: *maxEdge, Output: *output, Log: log,
+		AsHuman: *asHuman, PointerAt: live.PointerAt, SetPointerAt: live.SetPointerAt,
 		Exited: live.Exited, Settle: live.Settle, LockInput: live.LockInput,
 		ClipboardText: live.ClipboardText, SetClipboardText: live.SetClipboardText}
 
+	if *sites != "" {
+		d.Sites = &desktop.Sites{Path: *sites}
+	}
 	if *replay {
 		d.Replay = &desktop.Replay{Screen: live, Dir: *replayDir, Width: *replayWidth, Size: *replayFrames, Keep: *replayKeep,
 			Settle: 300 * time.Millisecond, Encode: desktop.EncodeClip, Log: log}
@@ -101,7 +109,7 @@ func main() {
 		d.A11y = a
 	}
 
-	log.Info("serving", "revision", revision(), "max_edge", *maxEdge, "a11y", *a11y, "output", *output, "seat", *seat)
+	log.Info("serving", "revision", revision(), "max_edge", *maxEdge, "a11y", *a11y, "output", *output, "seat", *seat, "as_human", *asHuman)
 	if err := d.Server(revision()).Run(ctx, &mcp.StdioTransport{}); err != nil && ctx.Err() == nil {
 		log.Error("serve", "err", err)
 		os.Exit(1)
@@ -119,6 +127,18 @@ func sessionBus() string {
 		dir = filepath.Join("/run/user", strconv.Itoa(os.Getuid()))
 	}
 	return "unix:path=" + filepath.Join(dir, "bus")
+}
+
+// defaultSitesFile is $XDG_CONFIG_HOME/swampcy/sites.json, or ~/.config/swampcy/sites.json.
+func defaultSitesFile() string {
+	if d := os.Getenv("XDG_CONFIG_HOME"); filepath.IsAbs(d) {
+		return filepath.Join(d, "swampcy", "sites.json")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".config", "swampcy", "sites.json")
 }
 
 // defaultReplayDir is $XDG_STATE_HOME/swampcy/replays, or ~/.local/state/swampcy/replays.

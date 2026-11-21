@@ -3,8 +3,10 @@ package desktop
 import (
 	"cmp"
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -225,6 +227,14 @@ func (l *Live) Keys(ctx context.Context, combos []Combo) error {
 	return in.Keys(combos, l.TypeDelay)
 }
 
+func (l *Live) Strokes(ctx context.Context, strokes []Stroke) error {
+	in, err := l.Input()
+	if err != nil {
+		return err
+	}
+	return in.Strokes(ctx, strokes)
+}
+
 // Launch starts an app on the session's display.
 func (l *Live) Launch(command string) (int, error) {
 	s, err := l.Session()
@@ -363,10 +373,51 @@ func (l *Live) Settle(ctx context.Context, quiet, most time.Duration) bool {
 	}
 }
 
+// pointerFile is where the swampcy processes on l's seat keep the place they last
+// put its pointer.
+func (l *Live) pointerFile() (string, bool) {
+	s, err := l.Session()
+	if err != nil {
+		return "", false
+	}
+	return s.RuntimeDir + "/swampcy/pointer-" + cmp.Or(l.Seat, "seat"), true
+}
+
+// PointerAt is where a swampcy last put the seat's pointer, in layout coordinates.
+func (l *Live) PointerAt() (x, y int, ok bool) {
+	p, ok := l.pointerFile()
+	if !ok {
+		return 0, 0, false
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return 0, 0, false
+	}
+	if _, err := fmt.Sscanf(string(b), "%d %d", &x, &y); err != nil {
+		return 0, 0, false
+	}
+	return x, y, true
+}
+
+// SetPointerAt keeps where the seat's pointer was put, for PointerAt.
+func (l *Live) SetPointerAt(x, y int) {
+	p, ok := l.pointerFile()
+	if !ok {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		return
+	}
+	_ = os.WriteFile(p, fmt.Appendf(nil, "%d %d\n", x, y), 0o600)
+}
+
 // LockInput takes the seat's input lock, shared by every swampcy on the session,
-// so that two agents' clicks and keys do not interleave. It gives up after ten
-// seconds and goes ahead: a lock is not worth a hung tool.
+// so that two agents' clicks and keys do not interleave. It gives up after two
+// minutes and goes ahead: a lock is not worth a hung tool. That is longer than
+// an action takes even as a person, typing a paragraph: the lock goes with its
+// holder's process, so one held that long is held by a server that is stuck.
 func (l *Live) LockInput() func() {
+	const lockWait = 2 * time.Minute
 	s, err := l.Session()
 	if err != nil {
 		return nil
@@ -379,13 +430,13 @@ func (l *Live) LockInput() func() {
 	if err != nil {
 		return nil
 	}
-	for deadline := time.Now().Add(10 * time.Second); ; {
+	for deadline := time.Now().Add(lockWait); ; {
 		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
 			return func() { f.Close() } // closing releases it
 		}
 		if time.Now().After(deadline) {
 			if l.Log != nil {
-				l.Log.Warn("input lock held by another swampcy for 10s; going ahead without it")
+				l.Log.Warn("input lock held by another swampcy for two minutes; going ahead without it")
 			}
 			f.Close()
 			return nil
