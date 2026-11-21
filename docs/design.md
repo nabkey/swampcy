@@ -14,6 +14,7 @@ the design has known limits.
 - [A named seat and a named output](#a-named-seat-and-a-named-output)
 - [Coordinates and screenshots](#coordinates-and-screenshots)
 - [Accessibility through AT-SPI](#accessibility-through-at-spi)
+- [Acting as a person](#acting-as-a-person)
 - [Fewer round trips](#fewer-round-trips)
 - [Dependencies](#dependencies)
 - [Two desktops on two seats](#two-desktops-on-two-seats)
@@ -204,6 +205,118 @@ went from about 9,600 tokens to about 3,800. `launch` also sets
 `org.a11y.Status.IsEnabled` on at start. Apps started another way may have no tree.
 
 Every D-Bus call has a timeout, so a hung app cannot hang a tool.
+
+## Acting as a person
+
+swampcy's ordinary input is what a program makes: the pointer is at one pixel and then at
+another with nothing between, a button goes down and up 40 ms apart at the exact centre of a
+widget, eighty characters arrive in a fifth of a second with no key held, and `click_element`
+presses a button without the pointer going near it. Two things want better. Some sites watch
+how they are used and refuse a visitor whose input no hand could make; Amazon is one. And a
+UI under test is only half tested by input users never send: hover states, handlers on
+motion, a search box that looks things up on each key.
+
+So the same tools can act as a hand would, switched on site by site. `Human`
+in `human.go` plans, and plans only: a pointer path is a list of points and waits, typing a
+list of keys with a pause before each and a hold. The tools and the virtual keyboard carry
+plans out. That keeps the planning testable with a seed and no clock.
+
+- **The pointer's path** is a cubic Bézier bowed to one side by a few percent of its length,
+  travelled on a minimum-jerk profile (slow, fast, slow) whose peak comes a little before
+  halfway, with tremor added as noise that drifts and dies away at both ends. It takes
+  `90 + 115·log2(distance/width + 1)` ms, Fitts's law with constants in the range measured
+  for a mouse, within 15% either way. Points go out about every 8 ms, a 125 Hz mouse.
+- **Missing.** On a path of 40 pixels or more, in a fifth to a half of them by length, the
+  first movement ends a few percent past the target, or sometimes short of it, and a second
+  small one corrects after a pause. This is how aimed movements go: a fast one by eye, then
+  corrections.
+- **Where a click lands** is within two pixels of where it was asked for, since the agent may
+  be aiming at something small. On a widget whose bounds are known it is anywhere about the
+  middle.
+- **Typing** draws each key's hold and the gap before it from log-normal distributions, with
+  longer gaps after a space, after punctuation, and before a key that needs Shift or a
+  reach. About three letters in a hundred are slips: the key beside the right one, or two
+  letters swapped, noticed at once or a letter or two later, backspaced and typed again.
+- **One person.** Each server draws a pace, 0.88 to 1.18, that scales all its times.
+
+A slip presses a key the agent did not ask for. In a text field that is harmless, since
+BackSpace takes it away. Where each key is a command it is not, so slips are only ever
+letters, never come before a newline or tab is undone, and `typos: false` turns them off.
+A field that completes what is typed as it is typed (a browser's address bar) is another
+place for `typos: false`: BackSpace there may take away the completion and leave the slip.
+
+A pointer can only click what is on the screen, where an action over the accessibility bus
+reaches a widget anywhere. So as a person `click_element`, `set_text` and `set_value` first
+scroll a widget that is out of view into it, with the wheel, and fail when that does not
+work, not click whatever is at the screen's edge. And `set_text` types, so a line break in
+its text would be Return and send the form: it refuses one and names the clipboard.
+
+Acting as a person, one action can take the input lock for half a minute, so servers
+waiting on it wait up to two minutes, not ten seconds, before going ahead without.
+
+The pointer's place has to be known for a path to start from it, and sway does not say where
+a seat's pointer is. Each server remembers where it put it and writes that to a file in the
+runtime directory, beside the input lock, so a new server (one for each agent session)
+carries on from where the last one stopped, not with a jump across the screen.
+
+**The tools that asked the app** do it by hand instead. A page's script gets real, trusted
+events from an AT-SPI action, so it is not the events that tell but what is missing around
+them. Measured in Chrome: `click_element`'s action is a press, release and click in the same
+millisecond at the widget's exact centre with no motion before it; `set_text` fills a field
+with no key or `input` event at all; `set_value` moves a slider with no pointer or key; and
+`scroll_to` moves the page two thousand pixels in one `scroll` event with no wheel. As a
+person, the first two use the pointer and keyboard, `scroll_to` turns the wheel a few clicks
+at a time until the element is in the middle of its window, sizing each turn by how far the
+last one moved it, and `set_value` clicks the slider's track where the value lies and
+finishes with arrow keys. Each falls back to asking the app only when the hand does not get
+there (an element in a scrolling area the pointer is not over, a spin button hundreds of
+steps away), and says so in its result, so the agent knows that one was not a person's.
+
+Chrome has a quirk the slider needs: a click on a focused slider's track changes its value
+but tells the accessibility bus nothing until a key is pressed. So when a click seems to
+have done nothing, `set_value` presses one arrow key, away from the nearer end of the range,
+and reads again before deciding what is left to do.
+
+**One switch per site.** Which sites need a hand is something an agent finds out by being
+refused, and should not have to find out twice. So the switch is kept by site in a file the
+agent reads and writes through two tools, `site_settings` and `set_site_settings`, and every
+later session, of any agent, acts on it. It is deliberately one boolean a site. The pieces
+are only convincing together (a hand's pointer path followed by text that appears with no
+keys is worse than neither), so there is nothing to tune apart, and an agent cannot leave a
+site half-configured. `-as-human` is what holds where no setting does, and `as_human` on a
+call is over both, for the one step that must be exact.
+
+swampcy knows which site a window shows by asking the browser: the web document in a
+window's accessibility tree carries its address (Chrome calls the attribute `URI`, Firefox
+`DocURL`). Finding it walks the browser's toolbar, so it is remembered for five seconds
+while the window's title stays, and not looked for at all while no site has a setting. A
+window that is no browser has no site, and gets the setting for every site, `*`.
+
+**What a page can still tell.** It changes input only, and not all of that. A review of the
+code as a writer of bot detection would read it left these, the first the largest:
+
+- *The machine.* The example session renders with pixman, so WebGL reports a software
+  renderer or is missing; the screen is exactly 1280x800 with a window that fills it; it is
+  Linux on a VM. No input changes that, nor the account, the address, or how many pages a
+  minute are asked for. `navigator.webdriver` is false, since Chrome is started with no
+  automation flag.
+- *The pointer has no idle life.* It moves only on the way to an action, stops dead, and acts
+  50 to 350 ms later. It never drifts while a page is read, never moves during a button's
+  hold or between wheel turns, and never wanders off without clicking.
+- *Timings are independent draws.* Key holds and gaps have a person's spread and overlap
+  now and then, but no structure: no fast digraphs, no difference between hands, no rhythm
+  across a word. Slips are always caught within two letters and always fixed.
+- *Clicks are near the middle* of what the agent aimed at, since the agent aims at middles,
+  with no lean towards the side the pointer came from.
+- *Characters off the US keymap* come from a key no US keyboard has (`IntlBackslash`), or for
+  accented letters from the plain letter's key with no dead key before it.
+- *The falls back.* `scroll_to` and `set_value` ask the app when the hand fails, and say so.
+  `key` with `hold_ms`, and a named `action` on `click_element`, are as they were. `launch`
+  taps Shift once at whatever has focus, as a person would not.
+- *One jump* when the pointer's place is not known (see [Known limits](#known-limits)).
+
+The cost is time: a click takes about a second and typing about five characters a second.
+An agent should paste long text, as a person would.
 
 ## Fewer round trips
 
@@ -540,6 +653,14 @@ on a machine anyone else can reach.
 - **Software encoding through hand-checked C struct offsets.** A library update that moves a
   layout makes swampcy refuse to encode until it is updated.
 - **Keymap swaps reach every app on the seat** when typing characters off the US keymap.
+- **Chrome turns a typed character beyond U+FFFF into another**: `type` of 😀 (U+1F600)
+  leaves U+F600 in a Chrome field, as a person or not. Paste such text.
+- **A window's site is what it showed up to five seconds ago** when its title has not
+  changed since, so the first action after a move between two sites with the same title may
+  go by the old site's setting. In an iframe from another site, the page's own site decides.
+- **As a person, the pointer's place is only what swampcy servers did with it.** After a
+  viewer on the same seat has moved the pointer, the next path starts from the old place, and
+  the app sees one jump. Characters off the US keymap are typed with a keymap swap each.
 - **A selection `clipboard_set` made is gone when that swampcy exits**, since a Wayland
   selection lives in the client that set it and the example session runs no clipboard manager.
 - **A popup is outlined with every window of its app**, since AT-SPI does not say which one

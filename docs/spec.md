@@ -68,7 +68,7 @@ no session of its own and serves nothing on the network.
   tools in parallel.
 - The same tools MUST be serialised across every swampcy on the seat, by an exclusive `flock`
   on `$XDG_RUNTIME_DIR/swampcy/input-<seat>.lock` held for the action (for the whole of a
-  `batch`). A lock not had within ten seconds MUST be gone without, with a warning logged.
+  `batch`). A lock not had within two minutes MUST be gone without, with a warning logged.
 - `click` MUST move the pointer to the point and press and release the button `count` times
   (1 to 3); `button` is `left`, `right` or `middle`. `modifiers` (`ctrl`, `shift`, `alt`,
   `super`, joined with `+`) MUST be held on swampcy's keyboard from before the first press
@@ -149,6 +149,95 @@ no session of its own and serves nothing on the network.
   and what the command wrote. It SHOULD then wait about half a second more, because
   a window appears before its first frame is drawn. A window that opened on another output
   (new windows open where seat0's focus is) MUST be moved to swampcy's output and focused.
+
+### Acting as a person
+
+- `click`, `move`, `drag`, `mouse_down`, `mouse_up`, `scroll`, `type`, `key`, `click_element`,
+  `set_text`, `scroll_to` and `set_value` MUST accept `as_human`. A call acts as a person
+  when its `as_human` is true; without one, when the site settings say so for the site its
+  window shows; and with no setting for that site, when swampcy was started with `-as-human`.
+  Otherwise, and always with `as_human: false`, it MUST act exactly as specified above.
+- Everything specified in this section MUST go on and off together. Only `typos` on `type`
+  is apart, and only for the one call.
+- A call's window is the one at its point (the focused one when it is there, else a visible
+  one), the one its element was found in, or for `type` and `key` the focused one. Its site
+  is the host, with any port, of the address the window's showing web document gives AT-SPI
+  (Chrome's `URI` attribute, Firefox's `DocURL`); a window that gives none has no site. A
+  window's site MAY be remembered for 5 s while its title stays, and when the window does
+  not answer, the site it last showed MUST be taken to be showing still.
+- The site settings MUST be the JSON file `-sites` names (default
+  `$XDG_CONFIG_HOME/swampcy/sites.json`; empty for no settings and no settings tools):
+  `{"as_human": {"<site>": true|false}}`. A site is a host, in lower case without `www.`,
+  with a port or without. A setting MUST hold for its host and that host's subdomains, on
+  its port only when it names one; the longest site that covers a window's site decides, and
+  `"*"` decides where none does, a window with no site included.
+- The file MUST be read again whenever its size or modification time has changed, written
+  by rename with mode 0600, and never written over while it does not parse. While it does
+  not parse, the settings last read from it MUST stay in force.
+- `site_settings` MUST say what holds for the site the focused window shows (or the `site`
+  given) and which setting says so, list every setting, say what holds without one, and name
+  the file. `set_site_settings` MUST set a site's switch from `as_human`, or with `remove`
+  take its setting away, and MUST refuse both or neither. `site` MAY be a host, a URL, or `*`.
+- The server's instructions MUST say what acting as a person changes, that it is kept per
+  site and by which tools, and with `-as-human` that it is on where no setting says.
+- As a person, the pointer MUST reach a point by motion from where it is: points about 8 ms
+  apart along a curved path with tremor, taking longer the further and the smaller the
+  target, staying on the output, and ending on the point exactly. The path MAY run past the
+  point or stop short of it and then correct, except while a button is held for `drag` or
+  `mouse_up`, where it MUST NOT.
+- Where the pointer is MUST be taken from `$XDG_RUNTIME_DIR/swampcy/pointer-<seat>`, where
+  every swampcy keeps the layout coordinates it last moved the seat's pointer to, when it
+  leaves the input lock. When that is missing or not on this output, the pointer is first put
+  somewhere in the middle half of the screen.
+- As a person, `click` MUST land within 2 layout pixels of its point each way, pause before
+  pressing, hold the button, and pause between the clicks of a double-click, each for a time
+  drawn afresh. Its `modifiers`, and `scroll`'s, MUST go down one after another before the
+  press and come up one after another after the release, with pauses between. `drag`,
+  `mouse_down`, `mouse_up` and `move` MUST end on their points exactly, and `move` MUST NOT
+  run past its point while a button `mouse_down` pressed is held.
+- As a person, `scroll` MUST leave a pointer within 12 layout pixels of its point where it
+  is, and MUST send its wheel clicks one at a time, a few close together and then a pause.
+- As a person, `type` MUST press each key a drawn time after the one before and hold it for
+  a drawn time, and `key` likewise. An unshifted character of the US keymap MAY go down
+  while those before it are still held, but not while its own key is; every other key MUST
+  go down with no other held. Shift and a shortcut's modifiers MUST go down a drawn time
+  before their key and come up a drawn time after it. A cancelled call MUST stop with no key
+  held.
+- As a person, a character off the US keymap MUST be typed alone on a keymap of its own: an
+  accented Latin letter on its unaccented letter's key, any other on evdev key 86
+  (`IntlBackslash`), never on Escape's.
+- As a person, `type` MAY make slips unless `typos` is false: a letter typed as a neighbouring
+  key, or two letters swapped, followed by up to two more characters, then one BackSpace for
+  each wrong or following character, then the right ones. What is left MUST be exactly the
+  text. A slip MUST replace only a letter, MUST NOT happen in a text of fewer than four
+  characters, and a BackSpace MUST NOT follow a newline or a tab. The result MUST say how
+  many slips were made.
+- As a person, `click_element` MUST click the widget with the pointer, at a point in the
+  middle 60% of its bounds each way, unless `action` names an action. `set_text` MUST click
+  the widget likewise, press ctrl+a unless the widget's text is empty, and type the text
+  (BackSpace for an empty one), with slips unless `typos` is false. It MUST refuse a text
+  with a line break or a tab, which typed would be Return or Tab, and say how else to enter it.
+- As a person, `click_element`, `set_text` and `set_value` MUST first bring a widget whose
+  centre is outside its window or the screen into view as `scroll_to` does, and MUST fail
+  without clicking when it is still outside.
+- As a person, `scroll_to` MUST put the pointer over the element's window when it is not
+  there, and send wheel clicks, at most 6 before looking again, until the element's centre
+  is in the middle half of the window's height (and within its width). When two turns in a
+  row do not move the element, it MUST stop if the element's centre is in the window, and
+  otherwise ask the app as `scroll_to` does without `as_human`, and say in the result that
+  this was not as a person would.
+- As a person, `set_value` MUST refuse a value outside the widget's range, do nothing when
+  the widget has the value, and otherwise click the widget, on a track at least 40 pixels
+  long at the point the value lies along it, and then press arrow keys (Right and Left, or
+  Up and Down when those change nothing) until the value is reached or is within half a
+  step. When the click appears to have changed nothing, it MUST first press one arrow key
+  and read the value again. When at most 40 presses would not reach the value, it MUST set
+  it as `set_value` does without `as_human`, and say in the result that this was not as a
+  person would.
+- In a `batch`, the pause after a step that acts as a person MUST be a person's (about 0.2 to 1.4 s)
+  instead of 80 ms.
+- `focus_window`, `move_window`, `close_window`, `launch` and the clipboard tools act the
+  same either way.
 
 ### Accessibility
 
